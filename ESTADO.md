@@ -1,6 +1,6 @@
 # Estado de la integración MercadoPago — API
 
-**Última actualización:** 29 de julio de 2026
+**Última actualización:** 30 de julio de 2026
 **Servicio:** `TecnisegurMercadoPago.Api` (.NET 10, ASP.NET Core)
 **Entorno probado:** Sandbox de MercadoPago con cuentas de prueba (Uruguay / MLU)
 
@@ -21,8 +21,41 @@ el `401` de `X-Api-Key` funciona. El túnel `cloudflared` ya no hace falta.
 Queda pendiente que el **DNS interno** resuelva el nombre (ver §6): hoy no lo
 hace, y eso bloquea a EmpleadoWeb.
 
-**EmpleadoWeb no fue modificado.** No hay una sola línea de código nuevo ahí; la
-integración desde el lado web está pendiente.
+~~**EmpleadoWeb no fue modificado.**~~ **Desactualizado al 30/07/2026:** EmpleadoWeb2022
+ya tiene la integración hecha. Ver "Novedades del 30 de julio" acá abajo.
+
+---
+
+## Novedades del 30 de julio de 2026
+
+### Cambió el concepto que ve el cliente
+
+`SuscripcionServicio.ArmarConcepto` pasó de generar
+`"Servicio de monitoreo de alarma - {cliente}"` a **`"TECNISEGUR ALARMAS - {cliente}"`**,
+para que la marca sea reconocible en el resumen de la tarjeta.
+
+El truncado a 255 caracteres sigue igual (MercadoPago corta los conceptos largos y es
+mejor controlarlo del lado nuestro). El texto nuevo es más corto que el viejo, así que el
+truncado se dispara todavía menos que antes.
+
+⚠️ **Sólo aplica a suscripciones nuevas.** Las que ya están dadas de alta en MercadoPago
+conservan el concepto viejo: `ArmarConcepto` corre en el alta, no en cada cobro. Si se
+quiere unificar, hay que hacer un `PUT /preapproval/{id}` sobre las existentes.
+
+### EmpleadoWeb ya no está pendiente
+
+Lo que decía §1 sobre que EmpleadoWeb no tenía una línea de código nuevo dejó de ser cierto.
+En `EmpleadoWeb2022` (rama `master`, commit `6ee2233`) ya están:
+
+- `Models/MercadoPagoApiCliente.cs` — el cliente HTTP contra esta API.
+- `Models/RenglonCobro.cs` — el listado de cotizaciones pasó a ser **una fila por cobro**,
+  no por cotización: suscripción y pago único son links distintos, con su propio mensaje de
+  WhatsApp y su propio estado en MercadoPago.
+- `CotizacionAlarmaController` — genera link de suscripción y de pago único por separado.
+- El diálogo de suscripción pide **día de adhesión**. Ojo: la API de MercadoPago trata
+  *días de prueba* y *fecha de adhesión* como **excluyentes**, no se pueden mandar juntos.
+
+El estado detallado de ese lado está en el `ESTADO.md` de `EmpleadoWeb2022`.
 
 ---
 
