@@ -1,0 +1,25 @@
+## Build
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+
+## Publicación
+publish/
+*.pubxml.user
+
+## Secretos — NUNCA versionar credenciales de MercadoPago
+appsettings.Development.json
+appsettings.Local.json
+appsettings.Production.json
+*.secrets.json
+.env
+
+## Logs
+*.log
+
+## Archivos de prueba con credenciales
+*.http
