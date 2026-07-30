@@ -371,7 +371,7 @@ public sealed class SuscripcionServicio
 
     private string ArmarConcepto(string nombreCliente)
     {
-        var concepto = $"Servicio de monitoreo de alarma - {nombreCliente.Trim()}";
+        var concepto = $"TECNISEGUR ALARMAS - {nombreCliente.Trim()}";
 
         // MercadoPago trunca los conceptos largos; mejor controlarlo acá.
         return concepto.Length > 255 ? concepto[..255] : concepto;
