@@ -198,6 +198,11 @@ public sealed class PagoServicio
                 ? (pago.DateApproved ?? pago.DateCreated)?.LocalDateTime
                 : null,
             JsonSerializer.Serialize(pago),
+            pago.MoneyReleaseDate?.LocalDateTime,
+            pago.TransactionDetails?.NetReceivedAmount,
+            pago.ComisionCalculada,
+            pago.RetencionesCalculadas,
+            pago.MoneyReleaseStatus,
             ct);
 
         if (!registrado)

@@ -1,24 +1,71 @@
 # Pendientes — retomar acá
 
-**Cerrado el:** 29 de julio de 2026
+**Cerrado el:** 31 de julio de 2026
 **Estado general:** la API está en producción y operando con credenciales reales
 de TECNISEGURURUGUAY. El circuito de suscripciones está probado de punta a punta.
 El de pagos únicos (Checkout Pro) está implementado pero **nunca se ejecutó**.
 
-> Lo que sigue está ordenado por urgencia. Los dos primeros bloquean el uso real.
+> Lo que sigue está ordenado por urgencia. Los tres primeros bloquean el uso real.
+
+---
+
+## 0. BLOQUEANTE — el alta de suscripciones está fallando en producción (31/07)
+
+`POST /preapproval` devuelve **500** `{"message":"Internal server error"}` con
+este payload, sacado del log del servidor:
+
+```json
+{"reason":"TECNISEGUR ALARMAS - MARIO CORTEZ","external_reference":"COT-31",
+ "payer_email":"NOTIENE@NOTIENE.COM",
+ "back_url":"https://www.tecnisegur.com.uy?cotizacion=31","status":"pending",
+ "auto_recurring":{"frequency":1,"frequency_type":"months",
+   "transaction_amount":1870.00,"currency_id":"UYU",
+   "start_date":"2026-08-01T12:00:00.000-03:00",
+   "end_date":"2026-09-30T16:44:59.255-03:00"}}
+```
+
+Sospechosos, en orden:
+
+1. **`payer_email` = `NOTIENE@NOTIENE.COM`** — el relleno que pone EmpleadoWeb
+   cuando la cotización no tiene `Correo`. Dominio inexistente.
+2. **`back_url` sin barra antes del `?`** — válido según la RFC, rechazado por
+   muchos validadores.
+
+Para aislarlo: `Herramientas/DiagnosticarAltaSuscripcion.ps1 -Pedir`. Manda el
+payload que falló y después una variante por campo; la primera que devuelva 201
+señala al culpable. Crea los preapproval en `pending` (no cobran nada) y los
+cancela solo.
+
+### Dos arreglos que corresponden igual, salga lo que salga
+
+- **Validar el correo en `SuscripcionServicio.CrearAsync`.** Una cotización sin
+  `Correo` no debería poder generar una suscripción: el `payer_email` es la
+  cuenta contra la que se asocia, y todos los avisos de MercadoPago (cobro,
+  rechazo, cancelación) irían a un buzón inexistente. Que el link se mande por
+  WhatsApp no lo salva. Devolver 400 con mensaje claro en vez de dejar que
+  MercadoPago conteste un 500 indescifrable.
+
+- **`end_date` se calcula desde hoy, no desde `start_date`**
+  (`SuscripcionServicio.cs:100`):
+
+  ```csharp
+  EndDate = solicitud.PlazoMeses.HasValue
+      ? DateTimeOffset.Now.AddMonths(solicitud.PlazoMeses.Value)   // ← mal
+  ```
+
+  Con `PlazoMeses = 2` y adhesión el 01/08, la suscripción termina el 30/09: dos
+  meses contados desde el 31/07. El desfasaje crece cuanto más lejos esté la
+  fecha de adhesión. Debería ser `(fechaInicio ?? DateTimeOffset.Now)`.
 
 ---
 
 ## 1. Desplegar lo que quedó compilado y sin subir
 
-Los dos proyectos compilan pero el servidor corre versiones viejas.
+### 1.1 API
 
-### 1.1 API — URGENTE, hay un bug activo
-
-El paquete está en `publish\`. **Mientras no se suba, los WhatsApp salen mal**:
-el binario desplegado tiene el mapeo viejo de la plantilla de Twilio, con el link
-en `{{2}}` y el importe en `{{3}}`, cuando la plantilla aprobada espera
-`{{2}}` = link y `{{3}}` = tipo. El cliente recibe los campos cruzados.
+> **Publicada el 31/07.** Incluye la captura de liberación, comisión y
+> retenciones, y el repaso periódico. La base ya tiene el DDL correspondiente
+> (`10_EstadoLiberacionInformado.sql`, ejecutado el 31/07).
 
 ```powershell
 $sitio = "C:\inetpub\wwwroot\TecnisegurMP Api"
@@ -33,9 +80,6 @@ curl.exe https://mpapi.tecnisegur.com.uy/health
 ```
 
 ⚠️ El `/XF web.config` es lo único que protege los secretos del servidor.
-
-También incluye el envío automático de WhatsApp al crear (campo `telefono` en el
-alta de suscripciones y pagos).
 
 ### 1.2 EmpleadoWeb
 
@@ -88,6 +132,81 @@ cotización controlada, importe mínimo, y avisar a quien reciba el link.
 
 ---
 
+## 3 bis. Liberación del dinero — lo que quedó abierto (31/07)
+
+### 3bis.1 El pool de IIS no está configurado para hospedar el repaso
+
+`ProcesadorNotificaciones` es un `BackgroundService`: **corre dentro del proceso
+de la API**, no es un job. Con los valores por defecto de IIS —Idle Time-out 20
+min, reciclado cada 29 h— el proceso se apaga por inactividad y el repaso se
+apaga con él.
+
+El campo `_proximoRepasoLiberacion` vive en memoria e inicia en `MinValue`, así
+que cada arranque dispara un repaso. Eso amortigua, pero deja una forma
+incómoda: **el día que no hay cobros nadie despierta el pool y el repaso no
+corre**, que es justo el día en que querés enterarte de una liberación o una
+reversión.
+
+```
+appcmd set apppool "TecnisegurMercadoPago" /startMode:AlwaysRunning
+appcmd set apppool "TecnisegurMercadoPago" /processModel.idleTimeout:00:00:00
+appcmd set site "TecnisegurMP Api" /applicationDefaults.preloadEnabled:true
+```
+
+Falta además documentarlo en `DEPLOY.md` §2.1, que hoy no lo menciona.
+
+### 3bis.2 Un contracargo tardío sobre una cuota no lo detecta nadie
+
+La ventana de gracia del repaso es de 10 días: pasada la liberación, la fila sale
+del conjunto y no se vuelve a consultar. Los contracargos en Uruguay pueden
+llegar hasta ~120 días.
+
+Y la notificación `payment` que MercadoPago mande por ese contracargo **se
+descarta**: `PagoServicio.cs:161-169` hace `return` sin escribir nada si el pago
+tiene `preapproval_id`. El descarte es correcto para lo que fue escrito —evitar
+contar el mismo cobro en `SuscripcionPago` y en `PagoUnico`— pero tira también
+los cambios de estado posteriores.
+
+> **Sin verificar:** si MercadoPago manda un `subscription_authorized_payment`
+> nuevo al revertirse una cuota, el caso se cubre solo. De eso depende que esto
+> sea un bug vivo o un hueco teórico.
+
+Arreglo propuesto: que la rama `payment`, cuando el pago tenga `preapproval_id`,
+en vez de `return` actualice `SuscripcionPago` por `MpPaymentId` — sólo estado y
+datos de liberación, sin insertar fila ni tocar importes. No hay doble conteo
+porque no inserta nada.
+
+El pago único no tiene el problema: su notificación `payment` sí se procesa.
+
+### 3bis.3 El repaso pregunta desde el día 0
+
+Consulta cada cuota todos los días aunque la fecha prevista sea el día 21: ~20
+llamadas por cuota que sabemos que van a decir `pending`. Con 100 suscripciones
+activas satura el tope de 100 por corrida sin necesidad.
+
+Arreglo: una condición más en el `WHERE` para no consultar antes de la fecha
+prevista, salvo que falten datos. Baja de ~21 llamadas por cuota a 1 o 2.
+
+### 3bis.4 Del lado del módulo TSD
+
+- `LiberacionConfirmada` no la selecciona nadie todavía
+  (`ServicioCobranzasMercadoPago.cs`, líneas 252 y 279). Sin ella, "confirmado
+  por MercadoPago" y "deducido del almanaque" se muestran igual, en la misma
+  celda verde.
+- `ProximaLiberacion` (líneas 70-76) sigue filtrando por `FechaLiberacion >
+  GETDATE()` puro. Un cobro con fecha vencida pero `pending` en MercadoPago suma
+  en *MontoALiberar* y no aparece en *Próxima liberación*: la pantalla dice que
+  hay plata por liberar sin decir cuándo.
+
+### 3bis.5 El reporte de Liberaciones sigue sin consumirse
+
+`money_release_status` confirma que MercadoPago liberó, no que el importe se
+acreditó en el banco. Para conciliar contra el extracto hace falta el reporte
+(`/v1/account/release_report`), hoy sólo accesible por
+`Herramientas/ReporteLiberaciones.ps1`.
+
+---
+
 ## 4. Seguridad — `CotizacionAlarmaController` no valida permisos
 
 La lista de usuarios habilitados está **sólo en la vista**
@@ -137,6 +256,20 @@ Ya no son teóricas: el sistema cobra dinero real.
 - **Rotar el Auth Token de Twilio.** Quedó escrito en el historial de la
   conversación del 29/07. Si ese registro se comparte o exporta, conviene
   regenerarlo desde la consola de Twilio.
+
+- **Rotar las credenciales de MercadoPago.** Dos exposiciones el 31/07:
+  el **Access Token de producción** quedó en el historial de PowerShell
+  (`ConsoleHost_history.txt`) al pasarse por línea de comando, y el **token de
+  credenciales de prueba** estaba escrito dentro de `.mcp.json` —además mal, con
+  el valor puesto donde va el nombre de la variable, así que nunca resolvió—.
+  El archivo ya quedó corregido a `${MERCADOPAGO_MCP_TOKEN}`.
+
+  Orden para rotar sin cortar el servicio: renovar en el panel → actualizar
+  `MercadoPago__AccessToken` en el `web.config` del servidor (guardar recicla el
+  pool solo) → verificar `/health` y una llamada contra MercadoPago → limpiar
+  `(Get-PSReadlineOption).HistorySavePath`. **No tocar el `WebhookSecret`**: es
+  independiente, y rotarlo sin querer deja todas las notificaciones en
+  `FirmaValida = 0` sin ningún síntoma visible.
 
 - **`ModoSandbox` es configuración muerta.** Está declarada en
   `MercadoPagoOpciones.cs` pero no la lee nadie. Borrarla o implementarla; hoy

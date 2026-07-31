@@ -307,11 +307,30 @@ public sealed class SuscripcionServicio
             var busqueda = await _mercadoPago
                 .BuscarPagosAutorizadosAsync(suscripcion.PreapprovalId!, ct);
 
+            /* Las cuotas ya registradas con neto no se vuelven a consultar: una
+               suscripción de 36 meses son 36 GET extra por sincronización, y las
+               cuotas viejas ya liberadas no cambian más. Sólo se pide el pago
+               completo de las aprobadas que todavía no tienen el dato. */
+            var yaTienenNeto = (await _repositorio
+                    .ListarPagosAsync(suscripcion.IdSuscripcion, ct))
+                .Where(p => p.MontoNeto is not null && p.MpAuthorizedPaymentId is not null)
+                .Select(p => p.MpAuthorizedPaymentId!)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             foreach (var cuota in busqueda.Results)
             {
+                var idCuota = cuota.Id?.ToString();
+
+                var liberacion =
+                    cuota.Payment?.Status == "approved" &&
+                    (idCuota is null || !yaTienenNeto.Contains(idCuota))
+                        ? await _mercadoPago.ObtenerDatosLiberacionAsync(
+                            cuota.Payment?.Id?.ToString(), ct)
+                        : DatosLiberacion.Vacio;
+
                 await _repositorio.RegistrarPagoAsync(
                     suscripcion.IdSuscripcion,
-                    cuota.Id?.ToString(),
+                    idCuota,
                     cuota.Payment?.Id?.ToString(),
                     cuota.TransactionAmount ?? suscripcion.MontoMensual,
                     cuota.CurrencyId ?? suscripcion.Moneda ?? _opciones.Moneda,
@@ -323,6 +342,11 @@ public sealed class SuscripcionServicio
                         ? cuota.DebitDate?.LocalDateTime
                         : null,
                     JsonSerializer.Serialize(cuota),
+                    liberacion.FechaLiberacion,
+                    liberacion.MontoNeto,
+                    liberacion.Comision,
+                    liberacion.Retenciones,
+                    liberacion.EstadoLiberacionMp,
                     ct);
             }
 

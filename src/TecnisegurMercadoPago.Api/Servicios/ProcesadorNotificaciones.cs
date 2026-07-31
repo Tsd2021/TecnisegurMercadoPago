@@ -17,6 +17,17 @@ public sealed class ProcesadorNotificaciones : BackgroundService
     private static readonly TimeSpan Intervalo = TimeSpan.FromSeconds(15);
     private const int LotePorCiclo = 20;
 
+    /// <summary>
+    /// Cada cuánto se repasan las cuotas cuya liberación todavía no se puede dar
+    /// por cumplida. Una vez por día alcanza: la liberación tarda 21 días y un
+    /// contracargo no se resuelve en horas.
+    /// </summary>
+    private static readonly TimeSpan IntervaloRepasoLiberacion = TimeSpan.FromHours(24);
+
+    private const int LoteRepasoLiberacion = 100;
+
+    private DateTime _proximoRepasoLiberacion = DateTime.MinValue;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<ProcesadorNotificaciones> _log;
 
@@ -39,6 +50,7 @@ public sealed class ProcesadorNotificaciones : BackgroundService
             try
             {
                 await ProcesarLoteAsync(ct);
+                await RepasarLiberacionesAsync(ct);
             }
             catch (OperationCanceledException)
             {
@@ -73,6 +85,154 @@ public sealed class ProcesadorNotificaciones : BackgroundService
         }
 
         _log.LogInformation("Procesador de notificaciones detenido.");
+    }
+
+    /// <summary>
+    /// Repasa contra MercadoPago los cobros cuya liberación no se puede dar por
+    /// cumplida —cuotas mensuales y pagos únicos— y actualiza fecha, neto,
+    /// comisión, retenciones y estado de liberación.
+    ///
+    /// EXISTE PORQUE NO HAY WEBHOOK DE LIBERACIÓN. Se verificó contra la lista
+    /// oficial de tópicos el 31/07/2026: MercadoPago avisa de pagos, órdenes,
+    /// suscripciones, contracargos y fraude, pero no de que el dinero se liberó.
+    ///
+    /// Lo que sí hace, y no sabíamos hasta el 31/07, es informar
+    /// money_release_status en el pago. Así que reconsultar no sólo detecta la
+    /// reversión: confirma la liberación. Sigue sin ser un asiento contable
+    /// —para eso está el reporte de Liberaciones— pero deja de ser una promesa
+    /// que nadie vuelve a verificar.
+    ///
+    /// Sin este repaso, la pantalla de cobranzas diría "disponible" el día
+    /// previsto aunque el dinero se hubiera revertido tres semanas antes.
+    /// </summary>
+    private async Task RepasarLiberacionesAsync(CancellationToken ct)
+    {
+        if (DateTime.UtcNow < _proximoRepasoLiberacion) return;
+
+        /* Se agenda ANTES de trabajar: si el repaso falla, el próximo intento va
+           dentro de 24 h y no en el ciclo siguiente, que serían 15 segundos. */
+        _proximoRepasoLiberacion = DateTime.UtcNow.Add(IntervaloRepasoLiberacion);
+
+        using var scope = _scopeFactory.CreateScope();
+
+        var mercadoPago = scope.ServiceProvider
+            .GetRequiredService<MercadoPagoCliente>();
+
+        await RepasarCuotasAsync(scope, mercadoPago, ct);
+        await RepasarPagosUnicosAsync(scope, mercadoPago, ct);
+    }
+
+    private async Task RepasarCuotasAsync(
+        IServiceScope scope, MercadoPagoCliente mercadoPago, CancellationToken ct)
+    {
+        var suscripciones = scope.ServiceProvider
+            .GetRequiredService<SuscripcionRepositorio>();
+
+        var cuotas = await suscripciones.ListarCuotasSinLiberacionConfirmadaAsync(
+            tope: LoteRepasoLiberacion, ct: ct);
+
+        if (cuotas.Count == 0) return;
+
+        _log.LogInformation(
+            "Repasando la liberación de {Cantidad} cuotas.", cuotas.Count);
+
+        var actualizadas = 0;
+
+        foreach (var cuota in cuotas)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            var datos = await mercadoPago.ObtenerDatosLiberacionAsync(cuota.PaymentId, ct);
+
+            /* Sin datos no se toca nada: ObtenerDatosLiberacionAsync ya devolvió
+               Vacio ante un fallo, y escribir null sobre lo que había sería
+               perder información por un problema de red. */
+            if (!datos.HayDatos && datos.Estado is null) continue;
+
+            await suscripciones.ActualizarLiberacionAsync(
+                cuota.Id,
+                datos.Estado,
+                datos.DetalleEstado,
+                datos.FechaLiberacion,
+                datos.MontoNeto,
+                datos.Comision,
+                datos.Retenciones,
+                datos.EstadoLiberacionMp,
+                ct);
+
+            actualizadas++;
+
+            /* Una reversión es plata que se creía cobrada y no entró. Merece
+               warning y no debug: es exactamente lo que este repaso existe para
+               encontrar, y alguien tiene que enterarse. */
+            if (datos.Estado is "refunded" or "charged_back" or "cancelled")
+            {
+                _log.LogWarning(
+                    "La cuota {Id} de la suscripción {Suscripcion} pasó a {Estado}: " +
+                    "el dinero no se va a liberar.",
+                    cuota.Id, cuota.IdSuscripcion, datos.Estado);
+            }
+        }
+
+        _log.LogInformation(
+            "Repaso de cuotas terminado. {Actualizadas} de {Total} actualizadas.",
+            actualizadas, cuotas.Count);
+    }
+
+    /// <summary>
+    /// Lo mismo para los cobros de equipamiento. Se repasan aparte porque viven
+    /// en otra tabla, pero por la misma razón —y con más motivo: son los de
+    /// importe más alto, así que un contracargo que pase inadvertido acá cuesta
+    /// bastante más que una cuota mensual.
+    /// </summary>
+    private async Task RepasarPagosUnicosAsync(
+        IServiceScope scope, MercadoPagoCliente mercadoPago, CancellationToken ct)
+    {
+        var pagos = scope.ServiceProvider.GetRequiredService<PagoRepositorio>();
+
+        var pendientes = await pagos.ListarPagosSinLiberacionConfirmadaAsync(
+            tope: LoteRepasoLiberacion, ct: ct);
+
+        if (pendientes.Count == 0) return;
+
+        _log.LogInformation(
+            "Repasando la liberación de {Cantidad} pagos únicos.", pendientes.Count);
+
+        var actualizados = 0;
+
+        foreach (var pago in pendientes)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            var datos = await mercadoPago.ObtenerDatosLiberacionAsync(pago.PaymentId, ct);
+
+            if (!datos.HayDatos && datos.Estado is null) continue;
+
+            await pagos.ActualizarLiberacionAsync(
+                pago.Id,
+                datos.Estado,
+                datos.DetalleEstado,
+                datos.FechaLiberacion,
+                datos.MontoNeto,
+                datos.Comision,
+                datos.Retenciones,
+                datos.EstadoLiberacionMp,
+                ct);
+
+            actualizados++;
+
+            if (datos.Estado is "refunded" or "charged_back" or "cancelled")
+            {
+                _log.LogWarning(
+                    "El pago único {Id} de la cotización {Cotizacion} pasó a {Estado}: " +
+                    "el dinero no se va a liberar.",
+                    pago.Id, pago.IdCotizacion, datos.Estado);
+            }
+        }
+
+        _log.LogInformation(
+            "Repaso de pagos únicos terminado. {Actualizados} de {Total} actualizados.",
+            actualizados, pendientes.Count);
     }
 
     private async Task ProcesarLoteAsync(CancellationToken ct)
@@ -220,6 +380,14 @@ public sealed class ProcesadorNotificaciones : BackgroundService
             return;
         }
 
+        /* La cuota no trae ni el neto ni la fecha de liberación: hay que pedir el
+           pago completo. Sólo para las aprobadas — una cuota rechazada no libera
+           nada y la llamada sería puro gasto. */
+        var liberacion = cuota.Payment?.Status == "approved"
+            ? await mercadoPago.ObtenerDatosLiberacionAsync(
+                cuota.Payment?.Id?.ToString(), ct)
+            : DatosLiberacion.Vacio;
+
         await suscripciones.RegistrarPagoAsync(
             local.IdSuscripcion,
             authorizedPaymentId,
@@ -232,6 +400,11 @@ public sealed class ProcesadorNotificaciones : BackgroundService
             cuota.DebitDate?.LocalDateTime,
             cuota.Payment?.Status == "approved" ? cuota.DebitDate?.LocalDateTime : null,
             JsonSerializer.Serialize(cuota),
+            liberacion.FechaLiberacion,
+            liberacion.MontoNeto,
+            liberacion.Comision,
+            liberacion.Retenciones,
+            liberacion.EstadoLiberacionMp,
             ct);
 
         _log.LogInformation(

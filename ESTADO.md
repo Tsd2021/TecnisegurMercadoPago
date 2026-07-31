@@ -1,6 +1,6 @@
 # Estado de la integración MercadoPago — API
 
-**Última actualización:** 30 de julio de 2026
+**Última actualización:** 31 de julio de 2026
 **Servicio:** `TecnisegurMercadoPago.Api` (.NET 10, ASP.NET Core)
 **Entorno probado:** Sandbox de MercadoPago con cuentas de prueba (Uruguay / MLU)
 
@@ -23,6 +23,114 @@ hace, y eso bloquea a EmpleadoWeb.
 
 ~~**EmpleadoWeb no fue modificado.**~~ **Desactualizado al 30/07/2026:** EmpleadoWeb2022
 ya tiene la integración hecha. Ver "Novedades del 30 de julio" acá abajo.
+
+---
+
+## Novedades del 31 de julio de 2026 — liberación del dinero
+
+El tema del día fue **qué pasa entre que el cliente paga y que la plata es
+nuestra**. Son 21 días y hasta hoy el sistema no los modelaba.
+
+### El desglose quedó verificado contra un cobro real
+
+Cobro `166657246137` de la cuenta de producción — $20 con débito, aprobado el
+06/07, liberado el 27/07:
+
+```
+bruto                          20,00
+  mercadopago_fee              -1,22   (6,09 %)
+  tax_withholding-uruguay      -0,98   (5 %)
+  tax_withholding-lif_debito   -0,33   (2 %)
+                             -------
+neto acreditado                17,47
+```
+
+El descuento real fue **12,65 %, no 6,09 %**. De ahí que `Comision` y
+`Retenciones` sean dos columnas y no una: la comisión es un costo perdido, las
+retenciones son adelantos de impuestos que se acreditan contra DGI.
+
+**Las tres fuentes coinciden al centavo** — API de pagos, reporte de
+Liberaciones y lo que persiste la base. Y `money_release_date` coincide con la
+columna `DATE` del reporte con dos segundos de diferencia por redondeo.
+
+> **`ComisionCalculada` suma `fee_details`, no `charges_details`.** Se verificó
+> que `fee_details` trae **sólo** `mercadopago_fee`. Si trajera los tres
+> renglones, la comisión quedaría en $2,53 y las retenciones en $0 —el mismo
+> error que corrige el script 09, pero al revés y sin síntoma visible, porque
+> contra el neto los números cierran igual. Herramienta:
+> `Herramientas/VerificarDesglosePago.ps1`.
+
+### `money_release_status` — el hallazgo del día
+
+El script `08_EstadoLiberacionExplicito.sql` daba por sentado que
+`GET /v1/payments/{id}` no dice nada sobre el destino del dinero, y que la única
+forma de saberlo era comparar `money_release_date` contra la fecha de hoy.
+
+**Es falso.** El pago informa `money_release_status`, con valores `pending` y
+`released`. O sea que la misma llamada que ya se hacía confirma la liberación en
+vez de dejarla como previsión.
+
+Eso cambia `EstadoLiberacion` de deducción a dato informado. Ver
+`Database/10_EstadoLiberacionInformado.sql`.
+
+> Verificamos `"released"` con nuestros ojos. **`"pending"` no**: no había ningún
+> cobro en retención en la cuenta para mirar. Ese valor sale de la
+> documentación.
+
+### Qué se implementó
+
+| Cambio | Dónde |
+|---|---|
+| Captura de `money_release_status` | `Preference.cs:196` → `DatosLiberacion` |
+| Columna `EstadoLiberacionMp` en las dos tablas | `Database/10_...sql` |
+| `LiberacionConfirmada` en la vista de consumo | `vw_CobranzasMercadoPago` |
+| Repaso periódico de **pagos únicos** (faltaba) | `ProcesadorNotificaciones.RepasarPagosUnicosAsync` |
+| `Comision IS NULL` en el filtro del repaso | `SuscripcionRepositorio.cs:360` |
+
+`LiberacionConfirmada` se agregó como columna aparte y **no** como un quinto
+valor de `EstadoLiberacion`: el módulo de TSD ya está construido contra los
+cuatro valores del script 08 y compara contra los literales. `1` = MercadoPago
+lo confirmó, `0` = lo tiene pendiente, `NULL` = sin reconsultar todavía.
+
+El `Comision IS NULL` importa más de lo que parece: el script 09 anula esa
+columna a propósito en las filas viejas para que se recalculen. Sin esa
+condición, una cuota con neto y fecha ya cargados nunca volvía a consultarse y
+se quedaba sin comisión para siempre.
+
+### Cómo se entera el sistema de que el dinero se liberó
+
+**No hay webhook de liberación.** Se verificó contra la lista oficial de
+tópicos: MercadoPago avisa de pagos, órdenes, suscripciones, contracargos y
+fraude, pero no de que el dinero se liberó.
+
+Lo resuelve `ProcesadorNotificaciones`, un `BackgroundService` **dentro del
+proceso de la API** —no es un job de Windows ni de SQL Agent—: cada 24 horas
+toma hasta 100 cuotas y 100 pagos únicos sin liberación confirmada y consulta
+`GET /v1/payments/{id}` por cada uno.
+
+Latencia: **hasta 24 horas** desde que MercadoPago libera.
+
+```
+Día 0        el cliente autoriza  →  webhook  →  se cobra la cuota (~1 h)
+             ya se guardan FechaLiberacion (día 21) y EstadoLiberacionMp='pending'
+Días 1-20    el repaso pregunta cada 24 h. En TSD: "A liberar", amarillo
+Día 21       MercadoPago libera
+Día 21+24 h  el repaso trae 'released'. En TSD: "Liberado s/MP", verde
+Días 21-31   sigue en el conjunto por la ventana de gracia, por si hay reversión
+Día 31+      sale del conjunto
+```
+
+Para pagos únicos es igual, sin el salto cuota → pago.
+
+### La base de TSD ya está migrada
+
+`10_EstadoLiberacionInformado.sql` **ejecutado en TSD el 31/07**. Se verificó
+que las consultas textuales del módulo de escritorio
+(`ServicioCobranzasMercadoPago.cs`, líneas 249-257, 276-288 y 56-76) siguen
+resolviendo sin cambios.
+
+**TSD muestra la mejora sin recompilar**: no lee `EstadoLiberacionMp` directo,
+lo consume la vista al recalcular `EstadoLiberacion`.
 
 ---
 
@@ -394,4 +502,9 @@ arranca igual y esos endpoints devuelven 409 explicando qué falta.
 | `DEPLOY.md` | Publicación en IIS paso a paso |
 | `CLAUDE.md` | Convenciones y decisiones de diseño del código |
 | `Database/01_CrearTablasSuscripciones.sql` | DDL idempotente (ya ejecutado en TSD) |
+| `Database/05` … `10_*.sql` | Liberación, neto, comisión vs retenciones, vistas del módulo TSD |
+| `Herramientas/MCP.md` | Servidor MCP de MercadoPago |
+| `Herramientas/VerificarDesglosePago.ps1` | Contrasta comisión/retenciones/liberación de un cobro real contra el reporte |
+| `Herramientas/ReporteLiberaciones.ps1` | Baja el reporte de Liberaciones (exploratorio) |
+| `Herramientas/DiagnosticarAltaSuscripcion.ps1` | Aísla qué campo hace fallar un `POST /preapproval` |
 | `src/.../TecnisegurMercadoPago.Api.http` | Pruebas listas para ejecutar (no versionado) |

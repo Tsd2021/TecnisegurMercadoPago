@@ -8,6 +8,12 @@ namespace TecnisegurMercadoPago.Api.Datos;
 public sealed record ReservaPago(int Id, string ExternalReference);
 
 /// <summary>
+/// Cobro único pendiente de confirmar su liberación, para el repaso periódico.
+/// El equivalente de CuotaAReconsultar del lado de los pagos únicos.
+/// </summary>
+public sealed record PagoAReconsultar(int Id, int IdCotizacion, string PaymentId);
+
+/// <summary>
 /// Acceso a datos de los cobros únicos (Checkout Pro). Misma convención que
 /// SuscripcionRepositorio: ADO.NET directo, parámetros tipados, conexión en un
 /// using, y lecturas contra la vista y no contra la tabla.
@@ -229,8 +235,16 @@ public sealed class PagoRepositorio
         string? moneda,
         DateTime? fechaPago,
         string payloadJson,
+        DateTime? fechaLiberacion = null,
+        decimal? montoNeto = null,
+        decimal? comision = null,
+        decimal? retenciones = null,
+        string? estadoLiberacionMp = null,
         CancellationToken ct = default)
     {
+        /* ISNULL en los campos de liberación: una notificación posterior que no
+           los traiga no debe borrar los que ya estaban. Perder el dato es peor
+           que no actualizarlo. */
         const string sql = @"
             UPDATE dbo.PagoUnico
             SET MpPaymentId        = @MpPaymentId,
@@ -240,6 +254,11 @@ public sealed class PagoRepositorio
                 Moneda             = ISNULL(@Moneda, Moneda),
                 FechaPago          = @FechaPago,
                 PayloadJson        = @Payload,
+                FechaLiberacion    = ISNULL(@FechaLiberacion, FechaLiberacion),
+                MontoNeto          = ISNULL(@MontoNeto, MontoNeto),
+                Comision           = ISNULL(@Comision, Comision),
+                Retenciones        = ISNULL(@Retenciones, Retenciones),
+                EstadoLiberacionMp = ISNULL(@EstadoLiberacionMp, EstadoLiberacionMp),
                 FechaActualizacion = GETDATE()
             WHERE ExternalReference = @Referencia;";
 
@@ -255,8 +274,106 @@ public sealed class PagoRepositorio
         cmd.Parameters.Add("@Moneda", SqlDbType.Char, 3).Value = (object?)moneda ?? DBNull.Value;
         cmd.Parameters.Add("@FechaPago", SqlDbType.DateTime).Value = (object?)fechaPago ?? DBNull.Value;
         cmd.Parameters.Add("@Payload", SqlDbType.NVarChar, -1).Value = payloadJson;
+        cmd.Parameters.Add("@FechaLiberacion", SqlDbType.DateTime).Value = (object?)fechaLiberacion ?? DBNull.Value;
+        cmd.Parameters.Add("@MontoNeto", SqlDbType.Decimal).Value = (object?)montoNeto ?? DBNull.Value;
+        cmd.Parameters.Add("@Comision", SqlDbType.Decimal).Value = (object?)comision ?? DBNull.Value;
+        cmd.Parameters.Add("@Retenciones", SqlDbType.Decimal).Value = (object?)retenciones ?? DBNull.Value;
+        cmd.Parameters.Add("@EstadoLiberacionMp", SqlDbType.VarChar, 20).Value = (object?)estadoLiberacionMp ?? DBNull.Value;
 
         return await cmd.ExecuteNonQueryAsync(ct) > 0;
+    }
+
+    /// <summary>
+    /// Cobros únicos aprobados cuya liberación todavía no confirmó MercadoPago.
+    ///
+    /// Es el gemelo de SuscripcionRepositorio.ListarCuotasSinLiberacionConfirmadaAsync,
+    /// y existe por la misma razón: no hay webhook de liberación, así que el
+    /// único modo de enterarse de una reversión es volver a preguntar.
+    ///
+    /// Faltaba. El repaso diario cubría las cuotas mensuales pero no los pagos
+    /// únicos, que son los de importe más alto —el equipamiento— y por lo tanto
+    /// donde un contracargo silencioso duele más.
+    /// </summary>
+    public async Task<List<PagoAReconsultar>> ListarPagosSinLiberacionConfirmadaAsync(
+        int diasDeGracia = 10, int tope = 200, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT TOP (@Tope) p.Id, p.IdCotizacion, p.MpPaymentId
+            FROM dbo.PagoUnico AS p
+            WHERE p.Estado = 'approved'
+              AND p.MpPaymentId IS NOT NULL
+              AND (
+                    p.FechaLiberacion IS NULL
+                 OR p.MontoNeto IS NULL
+                 OR p.Comision IS NULL
+                 OR p.EstadoLiberacionMp IS NULL
+                 OR p.EstadoLiberacionMp <> 'released'
+                 OR p.FechaLiberacion > DATEADD(day, -@DiasGracia, GETDATE())
+              )
+            ORDER BY ISNULL(p.FechaActualizacion, p.FechaCreacion);";
+
+        var lista = new List<PagoAReconsultar>();
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Tope", SqlDbType.Int).Value = tope;
+        cmd.Parameters.Add("@DiasGracia", SqlDbType.Int).Value = diasDeGracia;
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            lista.Add(new PagoAReconsultar(
+                reader.GetInt32(reader.GetOrdinal("Id")),
+                reader.GetInt32(reader.GetOrdinal("IdCotizacion")),
+                reader.GetString(reader.GetOrdinal("MpPaymentId"))));
+        }
+
+        return lista;
+    }
+
+    /// <summary>
+    /// Actualiza sólo lo que cambia al reconsultar un cobro ya registrado. No
+    /// toca el importe bruto ni la fecha de pago: eso ya ocurrió.
+    /// </summary>
+    public async Task ActualizarLiberacionAsync(
+        int idPago,
+        string? estado,
+        string? estadoDetalle,
+        DateTime? fechaLiberacion,
+        decimal? montoNeto,
+        decimal? comision,
+        decimal? retenciones,
+        string? estadoLiberacionMp = null,
+        CancellationToken ct = default)
+    {
+        const string sql = @"
+            UPDATE dbo.PagoUnico
+            SET Estado             = ISNULL(@Estado, Estado),
+                EstadoDetalle      = ISNULL(@EstadoDetalle, EstadoDetalle),
+                FechaLiberacion    = ISNULL(@FechaLiberacion, FechaLiberacion),
+                MontoNeto          = ISNULL(@MontoNeto, MontoNeto),
+                Comision           = ISNULL(@Comision, Comision),
+                Retenciones        = ISNULL(@Retenciones, Retenciones),
+                EstadoLiberacionMp = ISNULL(@EstadoLiberacionMp, EstadoLiberacionMp),
+                FechaActualizacion = GETDATE()
+            WHERE Id = @Id;";
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Id", SqlDbType.Int).Value = idPago;
+        cmd.Parameters.Add("@Estado", SqlDbType.VarChar, 30).Value = (object?)estado ?? DBNull.Value;
+        cmd.Parameters.Add("@EstadoDetalle", SqlDbType.VarChar, 100).Value = (object?)estadoDetalle ?? DBNull.Value;
+        cmd.Parameters.Add("@FechaLiberacion", SqlDbType.DateTime).Value = (object?)fechaLiberacion ?? DBNull.Value;
+        cmd.Parameters.Add("@MontoNeto", SqlDbType.Decimal).Value = (object?)montoNeto ?? DBNull.Value;
+        cmd.Parameters.Add("@Comision", SqlDbType.Decimal).Value = (object?)comision ?? DBNull.Value;
+        cmd.Parameters.Add("@Retenciones", SqlDbType.Decimal).Value = (object?)retenciones ?? DBNull.Value;
+        cmd.Parameters.Add("@EstadoLiberacionMp", SqlDbType.VarChar, 20).Value = (object?)estadoLiberacionMp ?? DBNull.Value;
+
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     private static PagoUnicoDto Mapear(SqlDataReader r)
@@ -273,6 +390,13 @@ public sealed class PagoRepositorio
             return r.IsDBNull(i) ? null : r.GetDateTime(i);
         }
 
+        /* Null y no cero: cero es "no cobró comisión", null es "no se sabe". */
+        decimal? Importe(string columna)
+        {
+            var i = r.GetOrdinal(columna);
+            return r.IsDBNull(i) ? null : r.GetDecimal(i);
+        }
+
         return new PagoUnicoDto
         {
             IdPago            = r.GetInt32(r.GetOrdinal("IdPago")),
@@ -285,12 +409,17 @@ public sealed class PagoRepositorio
             NombreCliente     = Texto("NombreCliente"),
             PayerEmail        = Texto("PayerEmail"),
             Monto             = r.GetDecimal(r.GetOrdinal("Monto")),
+            MontoNeto         = Importe("MontoNeto"),
+            Comision          = Importe("Comision"),
+            Retenciones       = Importe("Retenciones"),
             Moneda            = Texto("Moneda"),
             Estado            = Texto("Estado"),
             EstadoDescripcion = Texto("EstadoDescripcion"),
             EstadoDetalle     = Texto("EstadoDetalle"),
             FechaCreacion     = r.GetDateTime(r.GetOrdinal("FechaCreacion")),
             FechaPago         = Fecha("FechaPago"),
+            FechaLiberacion   = Fecha("FechaLiberacion"),
+            EstadoLiberacionMp = Texto("EstadoLiberacionMp"),
             Origen            = Texto("Origen"),
             UsuarioCreacion   = Texto("UsuarioCreacion")
         };

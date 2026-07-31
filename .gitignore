@@ -23,3 +23,6 @@ appsettings.Production.json
 
 ## Archivos de prueba con credenciales
 *.http
+
+## Reportes descargados de MercadoPago — datos financieros de la cuenta
+Herramientas/reportes/

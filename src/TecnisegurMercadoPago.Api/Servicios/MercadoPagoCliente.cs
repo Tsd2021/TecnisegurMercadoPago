@@ -25,6 +25,36 @@ public sealed class MercadoPagoException : Exception
 }
 
 /// <summary>
+/// Datos de acreditación de un pago: cuándo MercadoPago libera el dinero y
+/// cuánto queda después de la comisión.
+///
+/// Todos los campos son nullables porque MercadoPago puede no informarlos —y
+/// porque null significa "no se sabe", que no es lo mismo que cero.
+/// </summary>
+public sealed record DatosLiberacion(
+    DateTime? FechaLiberacion,
+    decimal? MontoNeto,
+    decimal? Comision,
+    decimal? Retenciones = null,
+    string? Estado = null,
+    string? DetalleEstado = null,
+    string? EstadoLiberacionMp = null)
+{
+    public static readonly DatosLiberacion Vacio = new(null, null, null);
+
+    public bool HayDatos =>
+        FechaLiberacion is not null ||
+        MontoNeto is not null ||
+        EstadoLiberacionMp is not null;
+
+    /// <summary>
+    /// MercadoPago informó que el dinero está liberado. No se infiere de la
+    /// fecha: es lo que dice money_release_status.
+    /// </summary>
+    public bool Liberado => EstadoLiberacionMp == "released";
+}
+
+/// <summary>
 /// Cliente HTTP tipado contra la API de MercadoPago.
 /// Se registra con AddHttpClient, de modo que el HttpMessageHandler se reutiliza
 /// (no se instancia un HttpClient por llamada, que agota sockets).
@@ -181,6 +211,47 @@ public sealed class MercadoPagoCliente
             cuerpo: null,
             claveIdempotencia: null,
             ct);
+    }
+
+    /// <summary>
+    /// Cuándo se libera el dinero de un pago y cuánto entra neto.
+    ///
+    /// Existe como método aparte porque la cuota de una suscripción NO trae
+    /// estos datos: GET /authorized_payments/{id} devuelve un "payment" anidado
+    /// con id, status y status_detail nada más. El importe neto y la fecha de
+    /// liberación sólo están en el pago completo, así que hay que ir a buscarlo.
+    ///
+    /// Nunca lanza. Un fallo acá no puede invalidar el registro de una cuota que
+    /// ya se cobró: se devuelve <see cref="DatosLiberacion.Vacio"/>, las columnas
+    /// quedan en null y el repaso periódico las completa después.
+    /// </summary>
+    public async Task<DatosLiberacion> ObtenerDatosLiberacionAsync(
+        string? pagoId,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(pagoId)) return DatosLiberacion.Vacio;
+
+        try
+        {
+            var pago = await ObtenerPagoAsync(pagoId, ct);
+
+            return new DatosLiberacion(
+                pago.MoneyReleaseDate?.LocalDateTime,
+                pago.TransactionDetails?.NetReceivedAmount,
+                pago.ComisionCalculada,
+                pago.RetencionesCalculadas,
+                pago.Status,
+                pago.StatusDetail,
+                pago.MoneyReleaseStatus);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "No se pudieron obtener los datos de liberación del pago {Id}. " +
+                "Las columnas quedan sin completar.", pagoId);
+
+            return DatosLiberacion.Vacio;
+        }
     }
 
     private async Task<T> EnviarAsync<T>(

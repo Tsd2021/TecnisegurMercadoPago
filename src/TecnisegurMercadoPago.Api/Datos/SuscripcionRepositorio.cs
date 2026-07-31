@@ -5,6 +5,15 @@ using TecnisegurMercadoPago.Api.Modelos.Contratos;
 namespace TecnisegurMercadoPago.Api.Datos;
 
 /// <summary>
+/// Cuota pendiente de confirmar su liberación, para el repaso periódico.
+/// </summary>
+public sealed record CuotaAReconsultar(
+    int Id,
+    int IdSuscripcion,
+    string? AuthorizedPaymentId,
+    string PaymentId);
+
+/// <summary>
 /// Acceso a datos de suscripciones y cuotas. ADO.NET directo, siguiendo la
 /// convención del resto de los sistemas (TecnisegurApi, EmpleadoWeb):
 /// sin ORM, parámetros siempre tipados, conexión dentro de un using.
@@ -243,28 +252,47 @@ public sealed class SuscripcionRepositorio
         DateTime? fechaProgramada,
         DateTime? fechaPago,
         string payloadJson,
+        DateTime? fechaLiberacion = null,
+        decimal? montoNeto = null,
+        decimal? comision = null,
+        decimal? retenciones = null,
+        string? estadoLiberacionMp = null,
         CancellationToken ct = default)
     {
+        /* ISNULL en el UPDATE de los tres campos de liberación, y no asignación
+           directa: una notificación posterior que no traiga el neto —porque vino
+           por una vía que no consulta el pago completo— no debe borrar el que ya
+           estaba guardado. Perder el dato es peor que no actualizarlo. */
         const string sql = @"
             MERGE dbo.SuscripcionPago AS destino
             USING (SELECT @AuthorizedId AS MpAuthorizedPaymentId) AS origen
                 ON destino.MpAuthorizedPaymentId = origen.MpAuthorizedPaymentId
                AND origen.MpAuthorizedPaymentId IS NOT NULL
             WHEN MATCHED THEN
-                UPDATE SET MpPaymentId   = @PaymentId,
-                           Monto         = @Monto,
-                           Estado        = @Estado,
-                           EstadoPago    = @EstadoPago,
-                           DetalleEstado = @DetalleEstado,
-                           FechaPago     = @FechaPago,
-                           PayloadJson   = @Payload
+                UPDATE SET MpPaymentId        = @PaymentId,
+                           Monto              = @Monto,
+                           Estado             = @Estado,
+                           EstadoPago         = @EstadoPago,
+                           DetalleEstado      = @DetalleEstado,
+                           FechaPago          = @FechaPago,
+                           PayloadJson        = @Payload,
+                           FechaLiberacion    = ISNULL(@FechaLiberacion, destino.FechaLiberacion),
+                           MontoNeto          = ISNULL(@MontoNeto, destino.MontoNeto),
+                           Comision           = ISNULL(@Comision, destino.Comision),
+                           Retenciones        = ISNULL(@Retenciones, destino.Retenciones),
+                           EstadoLiberacionMp = ISNULL(@EstadoLiberacionMp, destino.EstadoLiberacionMp),
+                           FechaActualizacion = GETDATE()
             WHEN NOT MATCHED THEN
                 INSERT (IdSuscripcion, MpAuthorizedPaymentId, MpPaymentId,
                         Monto, Moneda, Estado, EstadoPago, DetalleEstado,
-                        FechaProgramada, FechaPago, FechaRegistro, PayloadJson)
+                        FechaProgramada, FechaPago, FechaRegistro, PayloadJson,
+                        FechaLiberacion, MontoNeto, Comision, Retenciones,
+                        EstadoLiberacionMp, FechaActualizacion)
                 VALUES (@IdSuscripcion, @AuthorizedId, @PaymentId,
                         @Monto, @Moneda, @Estado, @EstadoPago, @DetalleEstado,
-                        @FechaProgramada, @FechaPago, GETDATE(), @Payload);
+                        @FechaProgramada, @FechaPago, GETDATE(), @Payload,
+                        @FechaLiberacion, @MontoNeto, @Comision, @Retenciones,
+                        @EstadoLiberacionMp, GETDATE());
 
             UPDATE dbo.SuscripcionCotizacion
             SET FechaUltimoPago = CASE WHEN @EstadoPago = 'approved'
@@ -288,6 +316,123 @@ public sealed class SuscripcionRepositorio
         cmd.Parameters.Add("@FechaProgramada", SqlDbType.DateTime).Value = (object?)fechaProgramada ?? DBNull.Value;
         cmd.Parameters.Add("@FechaPago", SqlDbType.DateTime).Value = (object?)fechaPago ?? DBNull.Value;
         cmd.Parameters.Add("@Payload", SqlDbType.NVarChar, -1).Value = payloadJson;
+        cmd.Parameters.Add("@FechaLiberacion", SqlDbType.DateTime).Value = (object?)fechaLiberacion ?? DBNull.Value;
+        cmd.Parameters.Add("@MontoNeto", SqlDbType.Decimal).Value = (object?)montoNeto ?? DBNull.Value;
+        cmd.Parameters.Add("@Comision", SqlDbType.Decimal).Value = (object?)comision ?? DBNull.Value;
+        cmd.Parameters.Add("@Retenciones", SqlDbType.Decimal).Value = (object?)retenciones ?? DBNull.Value;
+        cmd.Parameters.Add("@EstadoLiberacionMp", SqlDbType.VarChar, 20).Value = (object?)estadoLiberacionMp ?? DBNull.Value;
+
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Cuotas aprobadas cuya liberación todavía no se puede dar por cumplida.
+    ///
+    /// Son las que hay que reconsultar contra MercadoPago, porque no existe
+    /// webhook de liberación: MercadoPago informa money_release_date al aprobar
+    /// el cobro y después no vuelve a decir nada, ni siquiera si hubo un
+    /// contracargo que la dejó sin efecto.
+    ///
+    /// Devuelve tres grupos:
+    ///   - las que tienen algún dato de liberación sin completar (cuotas viejas,
+    ///     registradas antes de que se capturaran estos campos, o anuladas por
+    ///     09_SepararComisionDeRetenciones.sql para que se recalculen);
+    ///   - las que MercadoPago todavía no informó como 'released';
+    ///   - las liberadas hace poco, por si la reversión llegó tarde.
+    ///
+    /// El margen de gracia evita reconsultar para siempre toda la historia: una
+    /// cuota liberada y confirmada hace seis meses no va a cambiar.
+    /// </summary>
+    public async Task<List<CuotaAReconsultar>> ListarCuotasSinLiberacionConfirmadaAsync(
+        int diasDeGracia = 10, int tope = 200, CancellationToken ct = default)
+    {
+        /* Comision entra en el filtro además de MontoNeto porque el script 09 la
+           anula a propósito en las filas viejas —guardaban comisión y retenciones
+           sumadas— para que este repaso las recalcule. Sin esta condición, una
+           cuota que ya tuviera neto y fecha nunca volvería a consultarse y se
+           quedaría sin comisión para siempre.
+
+           EstadoLiberacionMp <> 'released' reemplaza a la comparación de fechas:
+           lo que cierra el caso es que MercadoPago lo informe, no que haya pasado
+           el día previsto. La condición de fecha que quedaba (> GETDATE()) era
+           además redundante con la ventana de gracia. */
+        const string sql = @"
+            SELECT TOP (@Tope) p.Id, p.IdSuscripcion, p.MpAuthorizedPaymentId, p.MpPaymentId
+            FROM dbo.SuscripcionPago AS p
+            WHERE p.EstadoPago = 'approved'
+              AND p.MpPaymentId IS NOT NULL
+              AND (
+                    p.FechaLiberacion IS NULL
+                 OR p.MontoNeto IS NULL
+                 OR p.Comision IS NULL
+                 OR p.EstadoLiberacionMp IS NULL
+                 OR p.EstadoLiberacionMp <> 'released'
+                 OR p.FechaLiberacion > DATEADD(day, -@DiasGracia, GETDATE())
+              )
+            ORDER BY ISNULL(p.FechaActualizacion, p.FechaRegistro);";
+
+        var lista = new List<CuotaAReconsultar>();
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Tope", SqlDbType.Int).Value = tope;
+        cmd.Parameters.Add("@DiasGracia", SqlDbType.Int).Value = diasDeGracia;
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            lista.Add(new CuotaAReconsultar(
+                reader.GetInt32(reader.GetOrdinal("Id")),
+                reader.GetInt32(reader.GetOrdinal("IdSuscripcion")),
+                Texto(reader, "MpAuthorizedPaymentId"),
+                Texto(reader, "MpPaymentId")!));
+        }
+
+        return lista;
+    }
+
+    /// <summary>
+    /// Actualiza sólo los campos que cambian al reconsultar un pago ya
+    /// registrado. No toca el importe bruto ni las fechas de cobro: eso ya
+    /// ocurrió y no se reescribe.
+    /// </summary>
+    public async Task ActualizarLiberacionAsync(
+        int idPago,
+        string? estadoPago,
+        string? detalleEstado,
+        DateTime? fechaLiberacion,
+        decimal? montoNeto,
+        decimal? comision,
+        decimal? retenciones,
+        string? estadoLiberacionMp = null,
+        CancellationToken ct = default)
+    {
+        const string sql = @"
+            UPDATE dbo.SuscripcionPago
+            SET EstadoPago         = ISNULL(@EstadoPago, EstadoPago),
+                DetalleEstado      = ISNULL(@DetalleEstado, DetalleEstado),
+                FechaLiberacion    = ISNULL(@FechaLiberacion, FechaLiberacion),
+                MontoNeto          = ISNULL(@MontoNeto, MontoNeto),
+                Comision           = ISNULL(@Comision, Comision),
+                Retenciones        = ISNULL(@Retenciones, Retenciones),
+                EstadoLiberacionMp = ISNULL(@EstadoLiberacionMp, EstadoLiberacionMp),
+                FechaActualizacion = GETDATE()
+            WHERE Id = @Id;";
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Id", SqlDbType.Int).Value = idPago;
+        cmd.Parameters.Add("@EstadoPago", SqlDbType.VarChar, 30).Value = (object?)estadoPago ?? DBNull.Value;
+        cmd.Parameters.Add("@DetalleEstado", SqlDbType.VarChar, 100).Value = (object?)detalleEstado ?? DBNull.Value;
+        cmd.Parameters.Add("@FechaLiberacion", SqlDbType.DateTime).Value = (object?)fechaLiberacion ?? DBNull.Value;
+        cmd.Parameters.Add("@MontoNeto", SqlDbType.Decimal).Value = (object?)montoNeto ?? DBNull.Value;
+        cmd.Parameters.Add("@Comision", SqlDbType.Decimal).Value = (object?)comision ?? DBNull.Value;
+        cmd.Parameters.Add("@Retenciones", SqlDbType.Decimal).Value = (object?)retenciones ?? DBNull.Value;
+        cmd.Parameters.Add("@EstadoLiberacionMp", SqlDbType.VarChar, 20).Value = (object?)estadoLiberacionMp ?? DBNull.Value;
 
         await cmd.ExecuteNonQueryAsync(ct);
     }
@@ -297,7 +442,9 @@ public sealed class SuscripcionRepositorio
     {
         const string sql = @"
             SELECT Id, MpAuthorizedPaymentId, MpPaymentId, Monto, Moneda,
-                   Estado, EstadoPago, DetalleEstado, FechaProgramada, FechaPago
+                   Estado, EstadoPago, DetalleEstado, FechaProgramada, FechaPago,
+                   FechaLiberacion, MontoNeto, Comision, Retenciones,
+                   EstadoLiberacionMp
             FROM dbo.SuscripcionPago
             WHERE IdSuscripcion = @Id
             ORDER BY ISNULL(FechaPago, FechaProgramada) DESC;";
@@ -324,7 +471,12 @@ public sealed class SuscripcionRepositorio
                 EstadoPago = Texto(reader, "EstadoPago"),
                 DetalleEstado = Texto(reader, "DetalleEstado"),
                 FechaProgramada = Fecha(reader, "FechaProgramada"),
-                FechaPago = Fecha(reader, "FechaPago")
+                FechaPago = Fecha(reader, "FechaPago"),
+                FechaLiberacion = Fecha(reader, "FechaLiberacion"),
+                MontoNeto = Importe(reader, "MontoNeto"),
+                Comision = Importe(reader, "Comision"),
+                Retenciones = Importe(reader, "Retenciones"),
+                EstadoLiberacionMp = Texto(reader, "EstadoLiberacionMp")
             });
         }
 
@@ -375,5 +527,15 @@ public sealed class SuscripcionRepositorio
     {
         var i = r.GetOrdinal(columna);
         return r.IsDBNull(i) ? null : r.GetInt32(i);
+    }
+
+    /// <summary>
+    /// Null y no cero cuando la columna está vacía. En cobranza son cosas
+    /// distintas: cero es "no cobró comisión", null es "todavía no se sabe".
+    /// </summary>
+    private static decimal? Importe(SqlDataReader r, string columna)
+    {
+        var i = r.GetOrdinal(columna);
+        return r.IsDBNull(i) ? null : r.GetDecimal(i);
     }
 }

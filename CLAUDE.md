@@ -70,6 +70,65 @@ Si `InsertarAsync` devuelve `null` es que el índice único rechazó el insert
 no dejarla huérfana. No cambiar ese comportamiento sin entender que la
 alternativa es cobrarle dos veces al cliente.
 
+### Liberación del dinero: `approved` no es lo mismo que cobrado
+
+La cuenta libera a **21 días**. Entre que MercadoPago aprueba el cobro y que la
+plata está disponible pasan tres semanas, y por el medio se descuenta más de lo
+que parece. Verificado contra el cobro real `166657246137` el 31/07/2026:
+
+```
+bruto 20,00  −  mercadopago_fee 1,22  −  tax_withholding 1,31  =  neto 17,47
+```
+
+**`Comision` y `Retenciones` son columnas separadas a propósito.** La comisión es
+un costo perdido; las retenciones son adelantos de impuestos que la empresa
+acredita contra DGI. Sumarlas informaría como gasto algo que en buena parte es
+recuperable, y sobreestimaría el costo de MercadoPago en más del doble.
+
+La comisión sale de sumar **`fee_details`**, que trae sólo `mercadopago_fee`. Las
+retenciones son el resto: `(bruto − neto) − comisión`. No derivar la comisión de
+`(bruto − neto)`: eso da comisión + retenciones juntas.
+
+`NULL` en cualquiera de estas columnas significa "MercadoPago todavía no lo
+informó", **nunca cero**. La interfaz las muestra como "—". Un neto en cero es
+indistinguible de "no se sabe", y en una pantalla de cobranza esa ambigüedad es
+un error de negocio.
+
+### No hay webhook de liberación — por eso existe el repaso
+
+MercadoPago avisa de pagos, órdenes, suscripciones, contracargos y fraude, pero
+**no** de que el dinero se liberó (verificado contra la lista de tópicos el
+31/07/2026). Informa `money_release_date` al aprobar y después no dice nada más.
+
+Lo cubre `ProcesadorNotificaciones.RepasarLiberacionesAsync`: cada **24 horas**
+toma hasta 100 cuotas y 100 pagos únicos sin liberación confirmada y consulta
+`GET /v1/payments/{id}`. Latencia: hasta 24 h desde que MercadoPago libera.
+
+La respuesta trae **`money_release_status`** (`pending` | `released`), que es lo
+que convierte la liberación de inferencia en dato informado. Antes se deducía
+comparando la fecha prevista contra hoy, lo que no distingue "se liberó" de
+"pasó la fecha y nadie sabe".
+
+En la vista, el orden del `CASE` importa: **lo que informa MercadoPago va antes
+que la comparación de fechas**. Un pago con `pending` y fecha vencida es
+*"A liberar"*, no *"Liberado"*.
+
+`EstadoLiberacion` conserva sus cuatro valores porque el módulo de TSD compara
+contra los literales; la precisión nueva va aparte, en `LiberacionConfirmada`
+(`1` confirmado, `0` pendiente, `NULL` sin reconsultar).
+
+Una cuota de suscripción **no** trae estos datos: `GET /authorized_payments/{id}`
+devuelve un `payment` anidado con `id`, `status` y `status_detail` nada más. Por
+eso hay que ir a buscar el pago completo, y por eso `ObtenerDatosLiberacionAsync`
+es un método aparte. No existe liberación a nivel suscripción: el `preapproval`
+no maneja dinero.
+
+`ObtenerDatosLiberacionAsync` **nunca lanza**. Un fallo de red no puede invalidar
+el registro de una cuota que ya se cobró: devuelve `Vacio`, las columnas quedan
+en `NULL` y el repaso las completa después. Por lo mismo, todos los `UPDATE` de
+estas columnas usan `ISNULL(@Campo, Campo)`: perder el dato es peor que no
+actualizarlo.
+
 ### Seguridad
 
 - `ApiKeyMiddleware` — header `X-Api-Key`, una clave por sistema consumidor,
@@ -88,7 +147,9 @@ Todo vive en la base **TSD** (`172.16.10.22`), junto a `CotizacionesComericales`
 la organización, ENCUESTA, está en otro servidor, por lo que no hay FK posible
 entre ambas.
 
-DDL en `Database/01_CrearTablasSuscripciones.sql`, idempotente.
+DDL en `Database/01_CrearTablasSuscripciones.sql`, idempotente. Los scripts se
+ejecutan **en orden numérico**: cada uno asume los anteriores, y varios recrean
+vistas que el siguiente vuelve a extender. Todos son idempotentes.
 
 - `SuscripcionCotizacion` — una fila por suscripción. Campos denormalizados
   (`NombreCliente`, `MontoMensual`) a propósito, para poder mostrar el estado sin

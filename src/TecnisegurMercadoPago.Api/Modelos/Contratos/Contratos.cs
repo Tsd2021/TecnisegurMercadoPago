@@ -141,13 +141,65 @@ public sealed class PagoSuscripcionDto
     public int Id { get; set; }
     public string? MpAuthorizedPaymentId { get; set; }
     public string? MpPaymentId { get; set; }
+
+    /// <summary>Lo que se le cobró al cliente.</summary>
     public decimal Monto { get; set; }
+
+    /// <summary>
+    /// Lo que efectivamente entra, ya descontada la comisión de MercadoPago
+    /// (4,99% + IVA = 6,09% con la configuración actual de la cuenta).
+    /// Null = MercadoPago todavía no lo informó. Nunca cero.
+    /// </summary>
+    public decimal? MontoNeto { get; set; }
+
+    /// <summary>Comisión propia de MercadoPago: 6,09 % con la tarifa actual.</summary>
+    public decimal? Comision { get; set; }
+
+    /// <summary>
+    /// Retenciones impositivas que MercadoPago aplica como agente de retención
+    /// en Uruguay. Separadas de la comisión a propósito: son adelantos de
+    /// impuestos acreditables contra DGI, no un costo perdido. Sobre un cobro
+    /// real con débito fueron 5 % (uruguay) + 2 % (LIF débito).
+    /// </summary>
+    public decimal? Retenciones { get; set; }
+
     public string? Moneda { get; set; }
     public string? Estado { get; set; }
     public string? EstadoPago { get; set; }
     public string? DetalleEstado { get; set; }
     public DateTime? FechaProgramada { get; set; }
+
+    /// <summary>Cuándo se le cobró al cliente.</summary>
     public DateTime? FechaPago { get; set; }
+
+    /// <summary>
+    /// Cuándo el dinero queda disponible: 21 días después del cobro con la
+    /// configuración actual.
+    ///
+    /// Es una PREVISIÓN informada por MercadoPago al aprobar el pago, no una
+    /// confirmación de que se liberó — no existe webhook de liberación. Un
+    /// contracargo dentro de esos 21 días la deja sin efecto sin avisar.
+    ///
+    /// Para saber si efectivamente se liberó, mirar <see cref="EstadoLiberacionMp"/>.
+    /// </summary>
+    public DateTime? FechaLiberacion { get; set; }
+
+    /// <summary>
+    /// Lo que informa MercadoPago sobre la liberación: "released" o "pending".
+    /// Null mientras el repaso diario no haya reconsultado el pago.
+    ///
+    /// A diferencia de <see cref="FechaLiberacion"/>, esto es un hecho y no una
+    /// previsión: la fecha dice cuándo se esperaba liberar, esto dice si pasó.
+    /// </summary>
+    public string? EstadoLiberacionMp { get; set; }
+
+    /// <summary>
+    /// True sólo cuando MercadoPago confirmó la liberación. Null es "todavía no
+    /// se sabe", que no es lo mismo que false.
+    /// </summary>
+    public bool? LiberacionConfirmada => EstadoLiberacionMp is null
+        ? null
+        : EstadoLiberacionMp == "released";
 }
 
 /// <summary>
@@ -220,12 +272,33 @@ public sealed class PagoUnicoDto
     public string? NombreCliente { get; set; }
     public string? PayerEmail { get; set; }
     public decimal Monto { get; set; }
+
+    /// <summary>Neto acreditado. Null = MercadoPago no lo informó. Ver PagoSuscripcionDto.</summary>
+    public decimal? MontoNeto { get; set; }
+
+    public decimal? Comision { get; set; }
+
+    /// <summary>Ver PagoSuscripcionDto.Retenciones.</summary>
+    public decimal? Retenciones { get; set; }
+
     public string? Moneda { get; set; }
     public string? Estado { get; set; }
     public string? EstadoDescripcion { get; set; }
     public string? EstadoDetalle { get; set; }
     public DateTime FechaCreacion { get; set; }
     public DateTime? FechaPago { get; set; }
+
+    /// <summary>Previsión de liberación (21 días). Ver PagoSuscripcionDto.</summary>
+    public DateTime? FechaLiberacion { get; set; }
+
+    /// <summary>Ver PagoSuscripcionDto.EstadoLiberacionMp.</summary>
+    public string? EstadoLiberacionMp { get; set; }
+
+    /// <summary>Ver PagoSuscripcionDto.LiberacionConfirmada.</summary>
+    public bool? LiberacionConfirmada => EstadoLiberacionMp is null
+        ? null
+        : EstadoLiberacionMp == "released";
+
     public string? Origen { get; set; }
     public string? UsuarioCreacion { get; set; }
 }
