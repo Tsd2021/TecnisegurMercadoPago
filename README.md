@@ -290,7 +290,11 @@ El resultado se fuerza con el **nombre del titular**:
 | `EXPI` | Error de fecha de vencimiento |
 | `CONT` | Pendiente |
 
-Documento: CI `12345678`.
+Documento: CI `12345672`.
+
+> Ojo con el dígito verificador. Acá figuraba `12345678` y el checkout lo rechaza
+> con *"Ingresá un documento válido"*: la cédula uruguaya lo valida, y para
+> `1.234.567` el dígito correcto es **2**, no 8. Verificado el 10/08/2026.
 
 ### 3.4 Recorrido de prueba
 

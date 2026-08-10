@@ -141,15 +141,73 @@ function Probar {
     }
 }
 
+function MostrarVeredictoFechas {
+
+    Write-Host ""
+    Write-Host "--- Fechas incoherentes ---" -ForegroundColor Cyan
+
+    if ($script:okFinAntes) {
+        Write-Host "  MercadoPago ACEPTA un end_date anterior al start_date." -ForegroundColor Yellow
+        Write-Host "  El preapproval queda creado y solo falla cuando el cliente" -ForegroundColor Yellow
+        Write-Host "  intenta autorizar. Es el defecto que corrige el calculo de" -ForegroundColor Yellow
+        Write-Host "  end_date desde la fecha de adhesion." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  MercadoPago rechaza el end_date invertido en el alta." -ForegroundColor Green
+    }
+
+    if ($script:okInicioPasado) {
+        Write-Host "  MercadoPago ACEPTA un start_date ya vencido." -ForegroundColor Yellow
+        Write-Host "  Confirma que un link generado con adhesion futura se vuelve" -ForegroundColor Yellow
+        Write-Host "  inautorizable con el correr de los dias sin avisar a nadie." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  MercadoPago rechaza el start_date vencido en el alta." -ForegroundColor Green
+    }
+}
+
+function MostrarHuerfanos {
+
+    if ($script:creados.Count -gt 0) {
+        Write-Host ""
+        Write-Host "ATENCION - quedaron preapproval sin cancelar:" -ForegroundColor Red
+        $script:creados | ForEach-Object { Write-Host ("  {0}" -f $_) -ForegroundColor Red }
+    }
+}
+
 # --------------------------------------------------------------------------
 # 1) Control: reproducir el fallo
 # --------------------------------------------------------------------------
 $control = Probar "CONTROL - el payload que fallo" (NuevoPayload)
 
+# --------------------------------------------------------------------------
+# 1 bis) Fechas incoherentes.
+#
+# Corren SIEMPRE, pase o falle el control, porque no buscan lo mismo que el
+# resto del script. Las demas variantes persiguen el 500 del alta; estas dos
+# buscan demostrar lo contrario: que MercadoPago las ACEPTA al crear y que por
+# eso el fallo se corre hasta que el cliente entra al init_point a autorizar.
+# Si dan 201, queda probado que un preapproval creado "bien" —201, init_point
+# valido, fila en la base— puede ser inautorizable desde el minuto cero.
+# --------------------------------------------------------------------------
+$p = NuevoPayload
+$p.payer_email = $MailAlternativo
+$p.auto_recurring.start_date = (Get-Date).AddDays(45).ToString($fmt)
+$p.auto_recurring.end_date   = (Get-Date).AddMonths(1).ToString($fmt)
+$okFinAntes = Probar "FIN ANTES DEL INICIO - adhesion a 45 dias, plazo 1 mes" $p
+
+$p = NuevoPayload
+$p.payer_email = $MailAlternativo
+$p.auto_recurring.start_date = (Get-Date).AddDays(-3).ToString($fmt)
+$okInicioPasado = Probar "INICIO YA VENCIDO - start_date de hace 3 dias" $p
+
 if ($control) {
     Write-Host ""
     Write-Host "El payload original funciono. El 500 era transitorio de MercadoPago." -ForegroundColor Green
     Write-Host "Reintenta el alta desde EmpleadoWeb." -ForegroundColor Green
+
+    MostrarVeredictoFechas
+    MostrarHuerfanos
     return
 }
 
@@ -201,8 +259,5 @@ else {
     Write-Host "  habilitado, o la aplicacion no es de tipo Suscripciones." -ForegroundColor Yellow
 }
 
-if ($creados.Count -gt 0) {
-    Write-Host ""
-    Write-Host "ATENCION - quedaron preapproval sin cancelar:" -ForegroundColor Red
-    $creados | ForEach-Object { Write-Host ("  {0}" -f $_) -ForegroundColor Red }
-}
+MostrarVeredictoFechas
+MostrarHuerfanos
