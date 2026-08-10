@@ -217,18 +217,42 @@ ese algo sigue abierto. Tres reparos concretos:
   aplicación de MercadoPago (`244721644743240`), distinta de la productiva
   (`437871649677590`). Entre las dos corridas cambiaron la cuenta **y** la
   aplicación.
-- **La aplicación productiva tiene `sandbox_mode: true`**, además de
-  `certification_status: "not_certified"`, `notifications_topics: []` y un
-  `callback_url` que sigue siendo el placeholder `https://www.mercadopago.com`.
-  Es un candidato tan bueno como `billing.allow`, y no se pudo comparar contra
-  la aplicación de prueba: `GET /applications/244721644743240` devuelve 404 con
-  nuestro token.
 - La documentación de MercadoLibre describe `address_pending` como la
   restricción que impide **publicar artículos en MercadoLibre**. No hay
   documentación que la vincule con la facturación recurrente de MercadoPago.
 
-Lo único firme es lo de arriba: **el payload es inocente**. Los dos sospechosos
-—cuenta sin dirección, aplicación en modo sandbox— hay que descartarlos de a uno.
+### Los dos candidatos, descartados (10/08, tarde)
+
+**`address_pending`: corregido, no era.** Se cargó la dirección desde
+*Direcciones* de la cuenta —no desde datos fiscales, que viene de la DGI y es de
+sólo lectura— y `GET /users/me` pasó a `billing.allow: true` con `codes: []`.
+Se generó una suscripción nueva (`8ef74c91585845b3b72e985de1ee0e7a`, COT-36,
+$15) con la API ya publicada —`back_url` con barra, `notification_url`, sin
+`end_date`— y **falló igual**: el comprador cargó tarjeta, cédula y su propio
+correo, el checkout no mostró ningún error, lo redirigió a
+`https://www.mercadopago.com` y la suscripción se auto-canceló a los 23 segundos.
+
+**`sandbox_mode`: es residual, no era.** Se creó una aplicación nueva desde el
+panel (`4615318147228313`) y nació con `sandbox_mode: true` igual que la
+productiva. Toda aplicación del panel viene así; el campo no distingue nada y no
+hay forma de cambiarlo (`PUT /applications/{id}` devuelve 403).
+
+### Estado: agotado desde afuera
+
+Todo lo verificable sin acceso interno a MercadoPago quedó descartado: payload,
+`back_url`, fechas, coincidencia de correo, webhook, dirección de la cuenta y
+modo de la aplicación.
+
+El hecho más filoso, y el que hay que empujar con soporte: **nunca se registra
+un intento de cobro**. `GET /v1/payments/search` sigue devolviendo los mismos 7
+pagos históricos, el más reciente del 29/07, ninguno de una suscripción. La
+tarjeta que carga el comprador jamás se convierte en un `payment`, y el
+preapproval queda siempre sin `payment_method_id`. Eso ocurre enteramente dentro
+de MercadoPago.
+
+Otro dato para ellos: la redirección va al `callback_url` de la **aplicación**
+(`https://www.mercadopago.com`, sin configurar) y no al `back_url` del
+preapproval, lo que sugiere que el flujo se corta a nivel de aplicación.
 
 **Tampoco se puede corregir con las credenciales que tenemos.** El
 `PUT https://api.mercadolibre.com/users/{id}` con `address/city/state/zip_code`
