@@ -253,6 +253,40 @@ Verificación en cualquier caso:
 GET https://api.mercadopago.com/users/me   →   status.billing.allow, address
 ```
 
+### El correo del checkout debe coincidir — trampa aparte, verificada
+
+**Verificado en sandbox el 10/08/2026.** Se creó una suscripción con
+`payer_email = A` y se completó el checkout escribiendo el correo `B`.
+MercadoPago rechaza:
+
+```
+URL: .../congrats/recover/subscription-invalid-user/
+
+"El pago falló...
+ Tu e-mail no coincide con el de la suscripción
+ Intenta nuevamente con el e-mail correcto.
+ Si no lo recuerdas, contacta al vendedor."
+```
+
+El `payer_email` no le ahorra el paso al cliente: la pantalla de confirmación
+tiene un campo *"Ingresá tu e-mail"* **vacío y obligatorio**, y lo que escriba
+tiene que coincidir exactamente con lo declarado al crear el preapproval.
+
+**El WhatsApp que se le manda no dice cuál es.** Un cliente que abre el link
+escribe el suyo, y el rechazo llega después de haber cargado la tarjeta.
+
+> **Esto NO explica la falla de Pablo del 10/08**, que vio *"Tuvimos un
+> problema"* —el mensaje genérico— y no éste. Son dos fallas distintas. Mientras
+> la cuenta siga bloqueada, todos chocan primero contra la genérica y ésta queda
+> latente. Se arregló igual, para que no sea el próximo misterio apenas se
+> destrabe la cuenta.
+
+Arreglo aplicado: el diálogo que muestra el link generado en EmpleadoWeb ahora
+muestra el correo que el cliente tiene que usar, para que el vendedor se lo pase
+junto con el link. Queda pendiente agregarlo también al mensaje de WhatsApp, que
+es una plantilla de Twilio (`ContentSid`) y necesita una variable nueva dada de
+alta de ese lado.
+
 ### Dos hallazgos laterales de la misma prueba
 
 - **La cédula de prueba del README es inválida.** `README.md:293` documenta
