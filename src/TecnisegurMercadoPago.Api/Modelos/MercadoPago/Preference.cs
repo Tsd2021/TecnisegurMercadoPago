@@ -81,6 +81,41 @@ public sealed class PreferenciaPagador
     [JsonPropertyName("name")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Name { get; set; }
+
+    /// <summary>
+    /// Documento del pagador. A diferencia del preapproval —donde la API no
+    /// tiene dónde ponerlo— Checkout Pro sí lo acepta, y mandarlo precarga el
+    /// campo del formulario de tarjeta. El emisor valida el documento contra el
+    /// titular, así que precargarlo con el del contrato evita el rechazo por
+    /// tipeo. Se omite si no se conoce: mandarlo vacío es peor que no mandarlo.
+    /// </summary>
+    [JsonPropertyName("identification")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PreferenciaIdentificacion? Identification { get; set; }
+
+    [JsonPropertyName("phone")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PreferenciaTelefono? Phone { get; set; }
+}
+
+public sealed class PreferenciaIdentificacion
+{
+    /// <summary>"CI" en Uruguay. MercadoPago lo valida contra el país de la cuenta.</summary>
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "CI";
+
+    [JsonPropertyName("number")]
+    public string Number { get; set; } = string.Empty;
+}
+
+public sealed class PreferenciaTelefono
+{
+    [JsonPropertyName("area_code")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? AreaCode { get; set; }
+
+    [JsonPropertyName("number")]
+    public string Number { get; set; } = string.Empty;
 }
 
 public sealed class PreferenciaBackUrls

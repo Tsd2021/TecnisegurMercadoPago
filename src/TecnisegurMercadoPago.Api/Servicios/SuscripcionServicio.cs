@@ -1,3 +1,4 @@
+using System.Net.Mail;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using TecnisegurMercadoPago.Api.Configuracion;
@@ -24,17 +25,20 @@ public sealed class SuscripcionServicio
 {
     private readonly MercadoPagoCliente _mercadoPago;
     private readonly SuscripcionRepositorio _repositorio;
+    private readonly CacheEstadoCuenta _cacheCuenta;
     private readonly MercadoPagoOpciones _opciones;
     private readonly ILogger<SuscripcionServicio> _log;
 
     public SuscripcionServicio(
         MercadoPagoCliente mercadoPago,
         SuscripcionRepositorio repositorio,
+        CacheEstadoCuenta cacheCuenta,
         IOptions<MercadoPagoOpciones> opciones,
         ILogger<SuscripcionServicio> log)
     {
         _mercadoPago = mercadoPago;
         _repositorio = repositorio;
+        _cacheCuenta = cacheCuenta;
         _opciones = opciones.Value;
         _log = log;
     }
@@ -57,6 +61,24 @@ public sealed class SuscripcionServicio
                 $"en estado '{existente.EstadoDescripcion}'. " +
                 "Cancele la existente antes de generar una nueva.");
         }
+
+        /* -------------------------------------------------------------------
+         * 1 bis) El correo es el único dato del pagador que viaja en un
+         *    preapproval: identifica al suscriptor y es la vía por la que
+         *    MercadoPago avisa cobros, rechazos y la cancelación automática
+         *    tras tres cuotas caídas. Si es inventado el cliente no se entera
+         *    de nada, así que se corta acá y no se crea la suscripción.
+         * ------------------------------------------------------------------- */
+        ValidarCorreoPagador(solicitud.PayerEmail);
+
+        /* -------------------------------------------------------------------
+         * 1 ter) Con la facturación bloqueada, MercadoPago igual devuelve 201 y
+         *    un init_point válido: el preapproval se crea, el link se manda, y
+         *    el cliente descubre el problema recién al confirmar la tarjeta,
+         *    con un "Tuvimos un problema" que no explica nada. Preguntar antes
+         *    mueve el aviso al vendedor, que es quien puede hacer algo.
+         * ------------------------------------------------------------------- */
+        await VerificarCuentaHabilitadaAsync(ct);
 
         var externalReference = $"COT-{solicitud.IdCotizacion}";
 
@@ -82,12 +104,40 @@ public sealed class SuscripcionServicio
             ? 0
             : solicitud.DiasPrueba ?? _opciones.DiasPruebaPorDefecto;
 
+        /* -------------------------------------------------------------------
+         * El plazo del contrato se cuenta desde que empieza a cobrarse, no
+         * desde hoy. Calcularlo con DateTimeOffset.Now hacía que una adhesión
+         * lejana con plazo corto produjera un end_date ANTERIOR al start_date:
+         * MercadoPago acepta ese preapproval en "pending" sin chistar y recién
+         * falla cuando el cliente entra al init_point a autorizar, que es el
+         * peor momento posible para enterarse.
+         *
+         * Los días de prueba también corren el arranque del cobro, así que
+         * entran en la cuenta: si no, el plazo se comería el free_trial.
+         * ------------------------------------------------------------------- */
+        var inicioCobro = (fechaInicio ?? DateTimeOffset.Now).AddDays(diasPrueba);
+
+        var fechaFin = solicitud.PlazoMeses.HasValue
+            ? inicioCobro.AddMonths(solicitud.PlazoMeses.Value)
+            : (DateTimeOffset?)null;
+
+        /* Con el cálculo de arriba la inversión no puede darse —PlazoMeses es
+           como mínimo 1—, pero la comprobación se deja puesta: es barata y deja
+           el invariante escrito para quien toque estas fechas más adelante. */
+        if (fechaFin.HasValue && fechaFin.Value <= inicioCobro)
+        {
+            throw new ReglaNegocioException(
+                "El plazo del contrato deja la suscripción terminando antes de " +
+                "empezar. Revise el plazo y la fecha de adhesión.");
+        }
+
         var preapproval = new PreapprovalSolicitud
         {
             Reason = ArmarConcepto(solicitud.NombreCliente),
             ExternalReference = externalReference,
             PayerEmail = solicitud.PayerEmail.Trim(),
             BackUrl = ArmarBackUrl(solicitud.IdCotizacion),
+            NotificationUrl = ArmarNotificationUrl(),
             Status = "pending",
             AutoRecurring = new AutoRecurring
             {
@@ -96,9 +146,7 @@ public sealed class SuscripcionServicio
                 TransactionAmount = solicitud.MontoMensual,
                 CurrencyId = _opciones.Moneda,
                 StartDate = fechaInicio,
-                EndDate = solicitud.PlazoMeses.HasValue
-                    ? DateTimeOffset.Now.AddMonths(solicitud.PlazoMeses.Value)
-                    : null,
+                EndDate = fechaFin,
                 FreeTrial = diasPrueba > 0
                     ? new FreeTrial { Frequency = diasPrueba, FrequencyType = "days" }
                     : null
@@ -142,6 +190,12 @@ public sealed class SuscripcionServicio
             respuesta.NextPaymentDate?.LocalDateTime,
             solicitud.UsuarioCreacion,
             solicitud.Origen,
+            /* El payload tal cual salió. Es la única forma de reconstruir por
+               qué un cliente no pudo autorizar: el preapproval queda en
+               "pending" para siempre y MercadoPago no guarda el intento
+               fallido. Con esto se ve el start_date y el end_date que se
+               mandaron, que es donde estuvieron los errores. */
+            JsonSerializer.Serialize(preapproval),
             ct);
 
         if (idSuscripcion is null)
@@ -402,24 +456,130 @@ public sealed class SuscripcionServicio
     }
 
     /// <summary>
+    /// Corta el alta si MercadoPago dice que la cuenta no puede facturar.
+    ///
+    /// Se apaga con MercadoPago:VerificarFacturacionHabilitada. El interruptor
+    /// existe porque la relación entre billing.allow y la autorización de
+    /// suscripciones está establecida por experimento —el mismo payload
+    /// autoriza contra una cuenta habilitada y falla contra una que no— pero no
+    /// por documentación de MercadoPago. Si algún día resulta que no era eso,
+    /// esto se apaga por configuración y no hay que publicar nada.
+    ///
+    /// Sólo bloquea ante un "no" explícito. Si la consulta falla, el alta sigue:
+    /// ver <see cref="MercadoPagoCliente.ObtenerEstadoCuentaAsync"/>.
+    /// </summary>
+    private async Task VerificarCuentaHabilitadaAsync(CancellationToken ct)
+    {
+        if (!_opciones.VerificarFacturacionHabilitada) return;
+
+        var estado = _cacheCuenta.Leer();
+
+        if (estado is null)
+        {
+            estado = await _mercadoPago.ObtenerEstadoCuentaAsync(ct);
+            _cacheCuenta.Guardar(estado);
+        }
+
+        if (!estado.Bloqueada) return;
+
+        /* Se olvida lo cacheado: si la cuenta se destraba en el minuto
+           siguiente, el próximo intento vuelve a preguntar en vez de repetir
+           el rechazo durante diez minutos. */
+        _cacheCuenta.Invalidar();
+
+        _log.LogError(
+            "Alta bloqueada: la cuenta de MercadoPago no tiene habilitada la " +
+            "facturación ({Motivos}). Las suscripciones no se pueden autorizar.",
+            estado.MotivosTexto);
+
+        throw new ReglaNegocioException(
+            "La cuenta de MercadoPago de Tecnisegur no tiene habilitada la " +
+            $"facturación ({estado.MotivosTexto}), así que el cliente no podría " +
+            "completar la suscripción aunque reciba el link. " +
+            "Avise a administración antes de generar el cobro.");
+    }
+
+    /// <summary>
+    /// Rechaza los correos que no sirven como identidad del suscriptor: los mal
+    /// formados, los rellenos tipo NOTIENE@NOTIENE.COM que pone el vendedor
+    /// cuando la cotización no tiene correo, y el de la propia cuenta cobradora
+    /// —nadie puede suscribirse a sí mismo—.
+    ///
+    /// Sin esto, MercadoPago contesta un 500 sin cuerpo útil, o peor: crea la
+    /// suscripción y el cliente nunca recibe un aviso.
+    /// </summary>
+    private void ValidarCorreoPagador(string correo)
+    {
+        var limpio = (correo ?? string.Empty).Trim();
+
+        /* MailAddress es más estricto que el [EmailAddress] del DTO, que da por
+           bueno cosas como "a@b". El try/catch es la única forma de usarlo:
+           TryCreate existe pero acepta lo mismo que el atributo. */
+        string dominio;
+
+        try
+        {
+            dominio = new MailAddress(limpio).Host.ToLowerInvariant();
+        }
+        catch (FormatException)
+        {
+            throw new ReglaNegocioException(
+                $"El correo '{limpio}' no es una dirección válida. " +
+                "Es el correo al que MercadoPago le avisa cada cobro.");
+        }
+
+        if (_opciones.DominiosCorreoVetados
+                .Any(d => string.Equals(d.Trim(), dominio, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ReglaNegocioException(
+                $"El correo '{limpio}' es un relleno, no una dirección real. " +
+                "Cargue el correo del cliente en el contrato antes de generar " +
+                "el cobro: es por donde MercadoPago avisa cobros y rechazos.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(_opciones.CorreoCobrador) &&
+            string.Equals(limpio, _opciones.CorreoCobrador.Trim(),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ReglaNegocioException(
+                "El correo del comprador es el de la cuenta de Tecnisegur. " +
+                "MercadoPago no permite que el pagador y el cobrador sean el mismo.");
+        }
+    }
+
+    /// <summary>
     /// Devuelve null —no cadena vacía— cuando no hay BackUrl configurada, para
     /// que el campo se omita del JSON. MercadoPago valida back_url como URL y
-    /// responde 400 si recibe "".
+    /// responde 400 si recibe "". El armado en sí vive en UrlRetorno, que lo
+    /// comparte con los pagos únicos.
     /// </summary>
     private string? ArmarBackUrl(int idCotizacion)
     {
-        if (string.IsNullOrWhiteSpace(_opciones.BackUrl))
+        var url = UrlRetorno.ConCotizacion(_opciones.BackUrl, idCotizacion);
+
+        if (url is null)
         {
             _log.LogWarning(
-                "No hay MercadoPago:BackUrl configurada. La suscripción se crea " +
-                "igual, pero el cliente no vuelve a ningún lado tras autorizar.");
-
-            return null;
+                "MercadoPago:BackUrl ausente o no absoluta ('{BackUrl}'). La " +
+                "suscripción se crea igual, pero el cliente no vuelve a ningún " +
+                "lado tras autorizar.",
+                _opciones.BackUrl);
         }
 
-        var separador = _opciones.BackUrl.Contains('?') ? "&" : "?";
-        return $"{_opciones.BackUrl}{separador}cotizacion={idCotizacion}";
+        return url;
     }
+
+    /// <summary>
+    /// El webhook configurado en el panel ya cubre las suscripciones, pero
+    /// mandarlo también en el preapproval lo deja atado a esta suscripción en
+    /// particular: si alguien toca la configuración del panel, las que ya
+    /// existen siguen notificando. Mismo criterio que PagoServicio con las
+    /// preferencias de Checkout Pro.
+    /// </summary>
+    private string? ArmarNotificationUrl()
+        => string.IsNullOrWhiteSpace(_opciones.UrlWebhook)
+            ? null
+            : _opciones.UrlWebhook.Trim();
 
     private async Task CancelarEnMercadoPagoSilencioso(
         string preapprovalId, CancellationToken ct)

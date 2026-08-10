@@ -29,10 +29,44 @@ public sealed class MercadoPagoOpciones
 
     /// <summary>
     /// URL pública del webhook. Se manda como notification_url en las
-    /// preferencias de Checkout Pro para reforzar la entrega de ese aviso.
-    /// Si queda vacía se omite el campo y rige sólo el webhook del panel.
+    /// preferencias de Checkout Pro y en los preapproval, para reforzar la
+    /// entrega de ese aviso. Si queda vacía se omite el campo y rige sólo el
+    /// webhook del panel.
     /// </summary>
     public string UrlWebhook { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Dominios que se rechazan como correo del pagador. Son los rellenos que
+    /// se cargan cuando la cotización no tiene correo: pasan la validación de
+    /// formato pero no existen, así que el cliente nunca recibe el aviso de
+    /// cobro ni el de rechazo.
+    ///
+    /// Va por configuración y no en el código porque la lista crece cada vez
+    /// que alguien inventa un relleno nuevo.
+    /// </summary>
+    public List<string> DominiosCorreoVetados { get; set; } = new();
+
+    /// <summary>
+    /// Correo de la cuenta cobradora. MercadoPago no permite que el pagador y
+    /// el cobrador sean el mismo; teniéndolo acá se rechaza antes de gastar una
+    /// llamada y se da un mensaje que se entiende. Opcional: si queda vacío no
+    /// se comprueba.
+    /// </summary>
+    public string CorreoCobrador { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Consultar GET /users/me antes de dar de alta una suscripción y rechazar
+    /// si la cuenta tiene la facturación bloqueada.
+    ///
+    /// Con la facturación bloqueada MercadoPago igual devuelve 201 y un
+    /// init_point válido, y el cliente descubre el problema recién al confirmar
+    /// la tarjeta. Esto adelanta el aviso al vendedor.
+    ///
+    /// Se puede apagar: la relación entre billing.allow y la autorización de
+    /// suscripciones está establecida por experimento, no por documentación de
+    /// MercadoPago. Ver ANALISIS-COBROS.md §2 bis.
+    /// </summary>
+    public bool VerificarFacturacionHabilitada { get; set; } = true;
 
     public string Moneda { get; set; } = "UYU";
 

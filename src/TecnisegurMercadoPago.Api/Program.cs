@@ -67,6 +67,9 @@ builder.Services.AddScoped<PagoServicio>();
 builder.Services.AddScoped<EnvioWhatsAppServicio>();
 builder.Services.AddSingleton<ValidadorFirmaWebhook>();
 
+/* Singleton: el estado de facturación es de la cuenta, no de la request. */
+builder.Services.AddSingleton<CacheEstadoCuenta>();
+
 builder.Services.AddHostedService<ProcesadorNotificaciones>();
 
 builder.Services.AddControllers();

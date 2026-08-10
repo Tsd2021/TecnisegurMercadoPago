@@ -73,7 +73,9 @@ public sealed class PagoServicio
             Payer = new PreferenciaPagador
             {
                 Email = solicitud.PayerEmail.Trim(),
-                Name = solicitud.NombreCliente.Trim()
+                Name = solicitud.NombreCliente.Trim(),
+                Identification = ArmarIdentificacion(solicitud.Documento),
+                Phone = ArmarTelefono(solicitud.Telefono)
             },
             Items =
             {
@@ -231,23 +233,58 @@ public sealed class PagoServicio
     }
 
     /// <summary>
+    /// La cédula se manda sólo en dígitos: en el contrato se carga a mano y
+    /// suele venir con puntos y guión ("1.234.567-8"), formato que MercadoPago
+    /// no acepta. Si no queda ningún dígito se devuelve null y el campo se
+    /// omite — precargar el checkout con basura es peor que no precargarlo.
+    /// </summary>
+    private static PreferenciaIdentificacion? ArmarIdentificacion(string? documento)
+    {
+        var digitos = SoloDigitos(documento);
+
+        return string.IsNullOrEmpty(digitos)
+            ? null
+            : new PreferenciaIdentificacion { Type = "CI", Number = digitos };
+    }
+
+    /// <summary>
+    /// El teléfono va sin código de área: el que se carga en el contrato es un
+    /// celular uruguayo ("099 123 456") donde el 099 es parte del número, no un
+    /// área separable.
+    /// </summary>
+    private static PreferenciaTelefono? ArmarTelefono(string? telefono)
+    {
+        var digitos = SoloDigitos(telefono);
+
+        return string.IsNullOrEmpty(digitos)
+            ? null
+            : new PreferenciaTelefono { Number = digitos };
+    }
+
+    private static string SoloDigitos(string? valor)
+        => string.IsNullOrWhiteSpace(valor)
+            ? string.Empty
+            : new string(valor.Where(char.IsDigit).ToArray());
+
+    /// <summary>
     /// auto_return sólo se manda junto con back_urls.success: MercadoPago
     /// responde 400 si recibe uno sin el otro. Sin BackUrl configurada se
     /// omiten los dos y el cliente simplemente se queda en MercadoPago.
     /// </summary>
     private void AplicarBackUrls(PreferenciaSolicitud preferencia, int idCotizacion)
     {
-        if (string.IsNullOrWhiteSpace(_opciones.BackUrl))
+        var url = UrlRetorno.ConCotizacion(_opciones.BackUrl, idCotizacion);
+
+        if (url is null)
         {
             _log.LogWarning(
-                "No hay MercadoPago:BackUrl configurada. El link de pago se crea " +
-                "igual, pero el cliente no vuelve a ningún lado tras pagar.");
+                "MercadoPago:BackUrl ausente o no absoluta ('{BackUrl}'). El link " +
+                "de pago se crea igual, pero el cliente no vuelve a ningún lado " +
+                "tras pagar.",
+                _opciones.BackUrl);
 
             return;
         }
-
-        var separador = _opciones.BackUrl.Contains('?') ? "&" : "?";
-        var url = $"{_opciones.BackUrl}{separador}cotizacion={idCotizacion}";
 
         preferencia.BackUrls = new PreferenciaBackUrls
         {

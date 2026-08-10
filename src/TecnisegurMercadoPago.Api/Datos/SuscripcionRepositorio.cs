@@ -134,6 +134,7 @@ public sealed class SuscripcionRepositorio
         DateTime? fechaProximoPago,
         string? usuarioCreacion,
         string? origen,
+        string? payloadEnvioJson,
         CancellationToken ct = default)
     {
         const string sql = @"
@@ -142,14 +143,14 @@ public sealed class SuscripcionRepositorio
                 IdCotizacion, ExternalReference, PreapprovalId, InitPoint,
                 NombreCliente, PayerEmail, MontoMensual, Moneda, DiasPrueba,
                 FechaInicio, Estado, FechaCreacion, FechaProximoPago,
-                UsuarioCreacion, Origen, FechaActualizacion
+                UsuarioCreacion, Origen, PayloadEnvioJson, FechaActualizacion
             )
             VALUES
             (
                 @IdCotizacion, @ExternalReference, @PreapprovalId, @InitPoint,
                 @NombreCliente, @PayerEmail, @MontoMensual, @Moneda, @DiasPrueba,
                 @FechaInicio, @Estado, GETDATE(), @FechaProximoPago,
-                @UsuarioCreacion, @Origen, GETDATE()
+                @UsuarioCreacion, @Origen, @PayloadEnvioJson, GETDATE()
             );
 
             SELECT CAST(SCOPE_IDENTITY() AS INT);";
@@ -174,6 +175,7 @@ public sealed class SuscripcionRepositorio
             cmd.Parameters.Add("@FechaProximoPago", SqlDbType.DateTime).Value = (object?)fechaProximoPago ?? DBNull.Value;
             cmd.Parameters.Add("@UsuarioCreacion", SqlDbType.VarChar, 50).Value = (object?)usuarioCreacion ?? DBNull.Value;
             cmd.Parameters.Add("@Origen", SqlDbType.VarChar, 20).Value = (object?)origen ?? DBNull.Value;
+            cmd.Parameters.Add("@PayloadEnvioJson", SqlDbType.NVarChar, -1).Value = (object?)payloadEnvioJson ?? DBNull.Value;
 
             var resultado = await cmd.ExecuteScalarAsync(ct);
             return Convert.ToInt32(resultado);

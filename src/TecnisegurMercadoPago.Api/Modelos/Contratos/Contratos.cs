@@ -228,6 +228,14 @@ public sealed class CrearPagoSolicitud
     /// </summary>
     public string? Concepto { get; set; }
 
+    /// <summary>
+    /// Cédula del cliente, de ContratoCotizacionAlarma.Documento. Opcional:
+    /// precarga el documento en el formulario de tarjeta del checkout, que el
+    /// emisor valida contra el titular. No aplica a las suscripciones — la API
+    /// de preapproval no tiene campo de identificación.
+    /// </summary>
+    public string? Documento { get; set; }
+
     public string? UsuarioCreacion { get; set; }
 
     /// <summary>"WEBEMPLEADO" o "TSD".</summary>

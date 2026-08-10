@@ -31,6 +31,16 @@ public sealed class PreapprovalSolicitud
     public string? BackUrl { get; set; }
 
     /// <summary>
+    /// Webhook propio de esta suscripción. Es redundante con el configurado en
+    /// el panel, y ahí está la gracia: si el del panel se rompe o alguien lo
+    /// cambia, las suscripciones ya creadas siguen avisando.
+    /// Se omite si no hay ninguna configurada.
+    /// </summary>
+    [JsonPropertyName("notification_url")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? NotificationUrl { get; set; }
+
+    /// <summary>
     /// "pending" para obtener init_point y que el cliente autorice en el
     /// entorno de MercadoPago. Con "authorized" haría falta card_token_id,
     /// lo que implicaría manejar datos de tarjeta (carga PCI).

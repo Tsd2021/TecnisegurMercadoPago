@@ -55,6 +55,23 @@ public sealed record DatosLiberacion(
 }
 
 /// <summary>
+/// Si la cuenta cobradora tiene habilitada la facturación.
+///
+/// <see cref="Habilitada"/> en null significa "no se pudo averiguar", que NO es
+/// lo mismo que "no habilitada": ante la duda se deja pasar el alta.
+/// </summary>
+public sealed record EstadoCuenta(bool? Habilitada, IReadOnlyList<string> Motivos)
+{
+    public static readonly EstadoCuenta Desconocido = new(null, Array.Empty<string>());
+
+    /// <summary>Sólo cuando MercadoPago dijo explícitamente que no.</summary>
+    public bool Bloqueada => Habilitada == false;
+
+    public string MotivosTexto =>
+        Motivos.Count == 0 ? "sin detalle" : string.Join(", ", Motivos);
+}
+
+/// <summary>
 /// Cliente HTTP tipado contra la API de MercadoPago.
 /// Se registra con AddHttpClient, de modo que el HttpMessageHandler se reutiliza
 /// (no se instancia un HttpClient por llamada, que agota sockets).
@@ -251,6 +268,41 @@ public sealed class MercadoPagoCliente
                 "Las columnas quedan sin completar.", pagoId);
 
             return DatosLiberacion.Vacio;
+        }
+    }
+
+    /// <summary>
+    /// Si la cuenta cobradora puede facturar. Se consulta antes de dar de alta
+    /// una suscripción: con la facturación bloqueada el preapproval se crea
+    /// igual —MercadoPago devuelve 201 y un init_point válido— pero el cliente
+    /// no puede autorizarlo, y se entera recién con la tarjeta en la mano.
+    ///
+    /// Nunca lanza. Un fallo de red no puede impedir dar de alta una
+    /// suscripción: devuelve <see cref="EstadoCuenta.Desconocido"/> y el alta
+    /// sigue su curso. Bloquear por no haber podido preguntar sería peor que
+    /// el problema que esto evita.
+    /// </summary>
+    public async Task<EstadoCuenta> ObtenerEstadoCuentaAsync(
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var usuario = await EnviarAsync<UsuarioCuentaRespuesta>(
+                HttpMethod.Get, "/users/me", cuerpo: null, claveIdempotencia: null, ct);
+
+            var billing = usuario.Status?.Billing;
+
+            if (billing is null) return EstadoCuenta.Desconocido;
+
+            return new EstadoCuenta(billing.Allow, billing.Codes);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "No se pudo consultar el estado de la cuenta en MercadoPago. " +
+                "El alta continúa sin la verificación.");
+
+            return EstadoCuenta.Desconocido;
         }
     }
 
