@@ -1,61 +1,90 @@
 # Pendientes — retomar acá
 
-**Cerrado el:** 31 de julio de 2026
+**Última revisión:** 11 de agosto de 2026
 **Estado general:** la API está en producción y operando con credenciales reales
-de TECNISEGURURUGUAY. El circuito de suscripciones está probado de punta a punta.
-El de pagos únicos (Checkout Pro) está implementado pero **nunca se ejecutó**.
+de TECNISEGURURUGUAY. **Ninguna suscripción productiva llegó nunca a cobrar.**
+El circuito de pagos únicos (Checkout Pro) está implementado pero **nunca se
+ejecutó**.
 
 > Lo que sigue está ordenado por urgencia. Los tres primeros bloquean el uso real.
 
 ---
 
-## 0. BLOQUEANTE — el alta de suscripciones está fallando en producción (31/07)
+## 0. BLOQUEANTE — MercadoPago no vincula el medio de pago (11/08)
 
-`POST /preapproval` devuelve **500** `{"message":"Internal server error"}` con
-este payload, sacado del log del servidor:
+**Punto de falla identificado y medido.** El cliente abre el link, carga la
+tarjeta, y **MercadoPago nunca asocia el medio de pago al preapproval**: no llega
+a `authorized` y se cancela solo a los ~22 segundos. El fallo es *anterior* a la
+autorización, no posterior.
 
-```json
-{"reason":"TECNISEGUR ALARMAS - MARIO CORTEZ","external_reference":"COT-31",
- "payer_email":"NOTIENE@NOTIENE.COM",
- "back_url":"https://www.tecnisegur.com.uy?cotizacion=31","status":"pending",
- "auto_recurring":{"frequency":1,"frequency_type":"months",
-   "transaction_amount":1870.00,"currency_id":"UYU",
-   "start_date":"2026-08-01T12:00:00.000-03:00",
-   "end_date":"2026-09-30T16:44:59.255-03:00"}}
+```
+Producción (3521850855) :  9 preapproval,  0 con medio de pago asociado
+Prueba     (3572201273) : 10 preapproval,  4 con medio de pago asociado
 ```
 
-Sospechosos, en orden:
+Mismo payload, mismo site MLU, mismo modelo `pending` → `init_point`. El
+razonamiento completo, con el control positivo que lo demuestra —tres preapproval
+cancelados de la cuenta de prueba que **conservan** `card_id` y
+`payment_method_id`, lo que descarta que los `null` de producción sean un
+artefacto de la cancelación— está en `ANALISIS-COBROS.md` §2 ter.
 
-1. **`payer_email` = `NOTIENE@NOTIENE.COM`** — el relleno que pone EmpleadoWeb
-   cuando la cotización no tiene `Correo`. Dominio inexistente.
-2. **`back_url` sin barra antes del `?`** — válido según la RFC, rechazado por
-   muchos validadores.
+**Está agotado desde afuera.** Descartados con evidencia: payload, `back_url`,
+fechas, coincidencia de correo, entrega de webhooks, dirección de la cuenta
+(`address_pending` se corrigió y siguió fallando) y `sandbox_mode` de la
+aplicación. También se descartó que la baja saliera de nuestro código: el
+inventario de emisores de `PUT status:cancelled` es cerrado y los 7 casos
+productivos quedaron con `MotivoCancelacion = 'Cancelada en MercadoPago'`.
 
-Para aislarlo: `Herramientas/DiagnosticarAltaSuscripcion.ps1 -Pedir`. Manda el
-payload que falló y después una variante por campo; la primera que devuelva 201
-señala al culpable. Crea los preapproval en `pending` (no cobran nada) y los
-cancela solo.
+### Lo único que queda: el ticket con soporte
 
-### Dos arreglos que corresponden igual, salga lo que salga
+```
+Aplicación productiva : 437871649677590  ·  collector 3521850855
 
-- **Validar el correo en `SuscripcionServicio.CrearAsync`.** Una cotización sin
-  `Correo` no debería poder generar una suscripción: el `payer_email` es la
-  cuenta contra la que se asocia, y todos los avisos de MercadoPago (cobro,
-  rechazo, cancelación) irían a un buzón inexistente. Que el link se mande por
-  WhatsApp no lo salva. Devolver 400 con mensaje claro en vez de dejar que
-  MercadoPago conteste un 500 indescifrable.
+Caso que falla        : preapproval 498c7bbb05124f908ed0eb6bafd85b8c  (COT-36, 11/08)
+                        creado    2026-08-11T16:07:37.763Z   webhook version 0
+                        nuestro GET 16:07:49.213Z            status pending
+                        cancelado 2026-08-11T16:08:03.385Z   webhook version 2
+                        25,6 s · payer_id 1858717677
+                        card_id AUSENTE de la respuesta · payment_method_id null
+                        summarized entero en null · nunca pasó por authorized
+                        free_trial 15 días · $15 UYU
+                        back_url https://www.tecnisegur.com.uy/  (sin parámetros)
+                        version 1 nunca notificada: MercadoPago mutó el recurso
+                        entre medio y no avisó
 
-- **`end_date` se calcula desde hoy, no desde `start_date`**
-  (`SuscripcionServicio.cs:100`):
+Caso que funciona     : preapproval 79f90fd0c82846b5ae22bc963aed465e
+                        cuenta de prueba, mismo payload, autorizó con master
 
-  ```csharp
-  EndDate = solicitud.PlazoMeses.HasValue
-      ? DateTimeOffset.Now.AddMonths(solicitud.PlazoMeses.Value)   // ← mal
-  ```
+Control decisivo      : en la cuenta de prueba, los preapproval CANCELADOS
+                        conservan card_id y payment_method_id (bc1ffe9b…, 79f90fd0…).
+                        La cancelación no borra esos campos, así que su ausencia
+                        en producción significa que nunca hubo tarjeta.
 
-  Con `PlazoMeses = 2` y adhesión el 01/08, la suscripción termina el 30/09: dos
-  meses contados desde el 31/07. El desfasaje crece cuanto más lejos esté la
-  fecha de adhesión. Debería ser `(fechaInicio ?? DateTimeOffset.Now)`.
+Alcance               : 10 suscripciones productivas, 0 con medio de pago asociado
+                        49 notificaciones subscription_preapproval, 0 payment jamás
+
+Síntoma del cliente   : tras confirmar la tarjeta vuelve al inicio de
+                        mercadopago.com, no al back_url del preapproval.
+```
+
+Pregunta concreta: **por qué el checkout de suscripciones no completa la
+vinculación del medio de pago en la cuenta 3521850855.** Los snapshots JSON para
+adjuntar quedan en `Herramientas/reportes/`.
+
+### No repetir la prueba con tarjeta real hasta que soporte responda
+
+Nueve intentos dieron el mismo resultado. Otro no agrega información y consume
+una cotización. La verificación tiene sentido **después** de que MercadoPago
+toque algo.
+
+### Herramientas de diagnóstico (sólo lectura)
+
+```powershell
+.\Herramientas\ForensePreapproval.ps1 -PreapprovalId <id> -Pedir -Etiqueta T4
+```
+
+Más `Database/12_ForenseUnaSuscripcion.sql` para el lado local. Ninguna de las
+dos modifica nada.
 
 ---
 
@@ -63,9 +92,28 @@ cancela solo.
 
 ### 1.1 API
 
-> **Publicada el 31/07.** Incluye la captura de liberación, comisión y
-> retenciones, y el repaso periódico. La base ya tiene el DDL correspondiente
-> (`10_EstadoLiberacionInformado.sql`, ejecutado el 31/07).
+> **Publicada el 10/08** con las fechas coherentes, la validación de correo, el
+> `notification_url` y `PayloadEnvioJson`. La base tiene hasta el script 11.
+>
+> **Sin publicar desde el 11/08** — nada de esto cambia el bloqueo de §0, pero
+> vale por sí solo:
+>
+> - **Auditoría de mutaciones** (`AuditoriaPreapproval`). Toda cancelación deja
+>   quién la originó, con qué estado previo y con qué correlación. Es lo que
+>   convierte "creemos que fue MercadoPago" en demostrable. Filtrar el log con
+>   `Select-String "AUDITORIA-PREAPPROVAL"`.
+> - **Guarda en el camino de carrera**: si el índice único rechaza el insert y el
+>   preapproval no está `pending`, ya no se cancela; se registra `ABORTADA`.
+> - **`back_url` sin parámetros** — `https://www.tecnisegur.com.uy/`.
+> - **`canceled` saliente** con lectura tolerante (`EstadoSuscripcion`). Ver la
+>   advertencia de abajo.
+> - `Database/13_EstadoCanceladaTolerante.sql`, idempotente y opcional.
+>
+> ⚠️ **`canceled` saliente no está verificado contra MercadoPago.** Está medido
+> que MP *responde* `cancelled` (dos eles) y que aceptaba ese valor en el PUT;
+> que acepte `canceled` no se probó. Si lo rechazara sería un 400 → 502 visible
+> en la interfaz, no un fallo silencioso. Se verifica gratis contra la cuenta de
+> prueba con `DiagnosticarAltaSuscripcion.ps1`, que crea en `pending` y cancela.
 
 ```powershell
 $sitio = "C:\inetpub\wwwroot\TecnisegurMP Api"
@@ -257,7 +305,9 @@ Ya no son teóricas: el sistema cobra dinero real.
   conversación del 29/07. Si ese registro se comparte o exporta, conviene
   regenerarlo desde la consola de Twilio.
 
-- **Rotar las credenciales de MercadoPago.** Dos exposiciones el 31/07:
+- **Rotar las credenciales de MercadoPago. ⚠️ URGENTE al 11/08.** Tercera
+  exposición del **Access Token de producción**: quedó pegado en texto plano en
+  el historial de una conversación de Claude Code. Las dos anteriores, del 31/07:
   el **Access Token de producción** quedó en el historial de PowerShell
   (`ConsoleHost_history.txt`) al pasarse por línea de comando, y el **token de
   credenciales de prueba** estaba escrito dentro de `.mcp.json` —además mal, con

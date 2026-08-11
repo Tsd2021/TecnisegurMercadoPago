@@ -115,15 +115,24 @@ public sealed class NotificacionRepositorio
         return lista;
     }
 
+    /// <summary>
+    /// <paramref name="nota"/> registra por qué una notificación se procesó sin
+    /// cambiar nada —típicamente que el preapproval no tiene fila local—. No es
+    /// un error: la notificación se procesó bien, sólo que no había a quién
+    /// aplicarla. Sin esta columna ese caso es indistinguible en la base de una
+    /// sincronización normal, y el único rastro queda en el stdout del servidor,
+    /// que es rotativo.
+    /// </summary>
     public async Task MarcarProcesadaAsync(
-        int id, bool exito, string? error, CancellationToken ct = default)
+        int id, bool exito, string? error, string? nota = null, CancellationToken ct = default)
     {
         const string sql = @"
             UPDATE dbo.MercadoPagoNotificacion
             SET Procesado       = @Exito,
                 FechaProceso    = CASE WHEN @Exito = 1 THEN GETDATE() ELSE FechaProceso END,
                 IntentosProceso = IntentosProceso + 1,
-                ErrorProceso    = @Error
+                ErrorProceso    = @Error,
+                NotaProceso     = @Nota
             WHERE Id = @Id;";
 
         await using var cn = Conexion();
@@ -133,6 +142,7 @@ public sealed class NotificacionRepositorio
         cmd.Parameters.Add("@Id", SqlDbType.Int).Value = id;
         cmd.Parameters.Add("@Exito", SqlDbType.Bit).Value = exito;
         cmd.Parameters.Add("@Error", SqlDbType.NVarChar, 1000).Value = (object?)error ?? DBNull.Value;
+        cmd.Parameters.Add("@Nota", SqlDbType.NVarChar, 400).Value = (object?)nota ?? DBNull.Value;
 
         await cmd.ExecuteNonQueryAsync(ct);
     }

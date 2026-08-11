@@ -131,8 +131,13 @@ public sealed class SuscripcionesController : ControllerBase
     {
         try
         {
+            /* Qué sistema pidió la baja. Va al rastro de auditoría: una
+               cancelación sin origen identificable es exactamente lo que costó
+               días de diagnóstico. */
+            var origen = HttpContext.Items["SistemaLlamador"] as string;
+
             return Ok(await _servicio.CancelarAsync(
-                idSuscripcion, solicitud?.Motivo, ct));
+                idSuscripcion, solicitud?.Motivo, origen, ct));
         }
         catch (ReglaNegocioException ex)
         {

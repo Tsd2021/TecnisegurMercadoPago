@@ -261,8 +261,13 @@ public sealed class ProcesadorNotificaciones : BackgroundService
         {
             try
             {
-                await ProcesarUnaAsync(pendiente, suscripciones, mercadoPago, pagos, ct);
-                await notificaciones.MarcarProcesadaAsync(pendiente.Id, true, null, ct);
+                /* La nota describe un proceso correcto que no cambió nada: no
+                   es un error y por eso no va en ErrorProceso. NULL es el caso
+                   normal, en que la notificación sí encontró a quién aplicarse. */
+                var nota = await ProcesarUnaAsync(
+                    pendiente, suscripciones, mercadoPago, pagos, ct);
+
+                await notificaciones.MarcarProcesadaAsync(pendiente.Id, true, null, nota, ct);
             }
             catch (Exception ex)
             {
@@ -271,12 +276,18 @@ public sealed class ProcesadorNotificaciones : BackgroundService
                     pendiente.MpNotificationId, pendiente.Tipo, pendiente.IntentosProceso + 1);
 
                 var error = ex.Message.Length > 1000 ? ex.Message[..1000] : ex.Message;
-                await notificaciones.MarcarProcesadaAsync(pendiente.Id, false, error, ct);
+                await notificaciones.MarcarProcesadaAsync(pendiente.Id, false, error, null, ct);
             }
         }
     }
 
-    private async Task ProcesarUnaAsync(
+    /// <summary>
+    /// Devuelve NULL cuando la notificación se aplicó sobre algo, y una nota
+    /// cuando se procesó correctamente pero sin efecto. Ese segundo caso no es
+    /// un error —no hay nada que reintentar— pero tiene que quedar registrado:
+    /// sin la nota, en la base es idéntico a una sincronización normal.
+    /// </summary>
+    private async Task<string?> ProcesarUnaAsync(
         NotificacionPendiente pendiente,
         SuscripcionRepositorio suscripciones,
         MercadoPagoCliente mercadoPago,
@@ -287,16 +298,15 @@ public sealed class ProcesadorNotificaciones : BackgroundService
         {
             _log.LogWarning(
                 "Notificación {Id} sin data.id: se descarta.", pendiente.MpNotificationId);
-            return;
+            return "Descartada: la notificación no trae data.id.";
         }
 
         switch (pendiente.Tipo)
         {
             /* Alta o cambio de estado de la suscripción */
             case "subscription_preapproval":
-                await SincronizarSuscripcionAsync(
+                return await SincronizarSuscripcionAsync(
                     pendiente.DataId, suscripciones, mercadoPago, ct);
-                break;
 
             /* Cuota generada o cobrada */
             case "subscription_authorized_payment":
@@ -317,11 +327,13 @@ public sealed class ProcesadorNotificaciones : BackgroundService
             default:
                 _log.LogInformation(
                     "Tipo de notificación no manejado: {Tipo}.", pendiente.Tipo);
-                break;
+                return $"Tipo no manejado: {pendiente.Tipo}.";
         }
+
+        return null;
     }
 
-    private async Task SincronizarSuscripcionAsync(
+    private async Task<string?> SincronizarSuscripcionAsync(
         string preapprovalId,
         SuscripcionRepositorio suscripciones,
         MercadoPagoCliente mercadoPago,
@@ -333,25 +345,47 @@ public sealed class ProcesadorNotificaciones : BackgroundService
 
         if (local is null)
         {
-            // Suscripción creada fuera del sistema (por ejemplo, a mano en el
-            // panel). Se registra el hecho pero no se inventa una fila.
-            _log.LogWarning(
-                "Notificación de la suscripción {Preapproval} sin registro local " +
-                "(external_reference={Referencia}).",
-                preapprovalId, remota.ExternalReference);
-            return;
+            /* Suscripción creada fuera del sistema (a mano en el panel, o por el
+               script de diagnóstico), o cuya fila ya no está. Se registra el
+               hecho y no se inventa una fila. La nota vuelve hasta el UPDATE de
+               la notificación: el warning del log no alcanza, porque el stdout
+               del servidor rota y esto se necesita meses después. */
+            return AuditoriaPreapproval.SinRegistroLocal(
+                _log,
+                preapprovalId,
+                remota.ExternalReference,
+                remota.Status,
+                AuditoriaPreapproval.Correlacion());
         }
 
+        /* El estado que se escribe sale SIEMPRE del GET que se acaba de hacer,
+           no del cuerpo de la notificación. Por eso una notificación vieja
+           reprocesada no puede degradar un estado más nuevo: escribe lo que
+           MercadoPago dice ahora, no lo que decía cuando se emitió. */
+        AuditoriaPreapproval.Recibida(
+            _log,
+            preapprovalId,
+            remota.ExternalReference ?? local.ExternalReference,
+            local.IdCotizacion,
+            local.Estado,
+            remota.Status,
+            AuditoriaPreapproval.Correlacion());
+
+        /* ParaPersistir traduce cualquier ortografía de "cancelada" al valor de
+           contrato: si MercadoPago empezara a responder 'canceled', escribirlo
+           verbatim dejaría a TSD y a EmpleadoWeb sin reconocer la baja. */
         await suscripciones.ActualizarEstadoAsync(
             preapprovalId,
-            remota.Status ?? local.Estado!,
+            EstadoSuscripcion.ParaPersistir(remota.Status ?? local.Estado!),
             remota.NextPaymentDate?.LocalDateTime,
-            remota.Status == "cancelled" ? "Cancelada en MercadoPago" : null,
+            EstadoSuscripcion.EsCancelada(remota.Status) ? "Cancelada en MercadoPago" : null,
             ct);
 
         _log.LogInformation(
-            "Suscripción {Preapproval} sincronizada. Estado: {Estado}.",
-            preapprovalId, remota.Status);
+            "Suscripción {Preapproval} sincronizada. Estado: {Estado} (antes {Anterior}).",
+            preapprovalId, remota.Status, local.Estado);
+
+        return null;
     }
 
     private async Task RegistrarCuotaAsync(

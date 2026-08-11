@@ -50,7 +50,7 @@ public sealed class EnvioWhatsAppServicio
                 "La suscripción no tiene link de adhesión para enviar.");
         }
 
-        if (suscripcion.Estado == "cancelled")
+        if (EstadoSuscripcion.EsCancelada(suscripcion.Estado))
         {
             throw new ReglaNegocioException(
                 "La suscripción está cancelada: su link ya no sirve para adherirse.");

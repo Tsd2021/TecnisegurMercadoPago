@@ -9,6 +9,9 @@ Este documento hace el inventario completo del recorrido de los datos y explica
 los cuatro defectos que se encontraron. Los arreglos ya están aplicados; lo que
 queda pendiente está al final.
 
+> **Leer §2 ter antes que §2 bis.** El 11/08 se midió dónde falla exactamente y
+> el resultado deja desactualizada la sección "Estado: agotado desde afuera".
+
 ---
 
 ## 1. El recorrido de los datos
@@ -213,10 +216,11 @@ una sintética (`"Test Address 123"`, zip `12800`).
 que el payload es inocente y que *algo* del entorno productivo bloquea. Cuál es
 ese algo sigue abierto. Tres reparos concretos:
 
-- **La prueba no aisló una sola variable.** El vendedor de prueba usa su propia
-  aplicación de MercadoPago (`244721644743240`), distinta de la productiva
-  (`437871649677590`). Entre las dos corridas cambiaron la cuenta **y** la
-  aplicación.
+- ~~**La prueba no aisló una sola variable.**~~ El vendedor de prueba usa su
+  propia aplicación de MercadoPago (`244721644743240`), distinta de la
+  productiva (`437871649677590`), así que entre las dos corridas cambiaron la
+  cuenta **y** la aplicación. **Resuelto el 11/08 con el control de §2 quinquies:
+  cambiando sólo la aplicación, el resultado no cambia.**
 - La documentación de MercadoLibre describe `address_pending` como la
   restricción que impide **publicar artículos en MercadoLibre**. No hay
   documentación que la vincule con la facturación recurrente de MercadoPago.
@@ -237,7 +241,11 @@ panel (`4615318147228313`) y nació con `sandbox_mode: true` igual que la
 productiva. Toda aplicación del panel viene así; el campo no distingue nada y no
 hay forma de cambiarlo (`PUT /applications/{id}` devuelve 403).
 
-### Estado: agotado desde afuera
+### ~~Estado: agotado desde afuera~~
+
+> **Desactualizado al 11/08/2026.** Quedaba una medición que no se había hecho y
+> que sí resuelve el punto de falla: ver §2 ter. Lo de abajo se conserva porque
+> el inventario de descartes sigue siendo válido.
 
 Todo lo verificable sin acceso interno a MercadoPago quedó descartado: payload,
 `back_url`, fechas, coincidencia de correo, webhook, dirección de la cuenta y
@@ -276,6 +284,283 @@ Verificación en cualquier caso:
 ```
 GET https://api.mercadopago.com/users/me   →   status.billing.allow, address
 ```
+
+---
+
+## 2 ter. Dónde falla, medido — 11/08/2026
+
+**El medio de pago nunca se asocia.** La suscripción no se cae después de
+autorizar: nunca llega a autorizar, porque MercadoPago no completa la
+vinculación de la tarjeta. El fallo es **anterior** a la autorización del
+preapproval.
+
+### Cómo se midió
+
+`GET /preapproval/{id}` sobre COT-36 (`8ef74c91585845b3b72e985de1ee0e7a`), la
+suscripción que falló el 10/08:
+
+```
+status               cancelled
+payer_id             1858717677
+card_id              null
+payment_method_id    null
+date_created         2026-08-10T20:24:31.155Z
+last_modified        2026-08-10T20:24:53.989Z      (22,8 s después)
+free_trial           15 días · first_invoice_offset 15
+```
+
+Por sí solos esos `null` no prueban nada: un preapproval cancelado **sí** vacía
+campos —`init_point` viene en null y sabemos que existió, porque el cliente
+abrió el link—. Hacía falta saber si la cancelación también borra la tarjeta.
+
+**No la borra.** En la cuenta de prueba hay tres preapproval cancelados que la
+conservan:
+
+| Preapproval | Status | `card_id` | `payment_method_id` |
+|---|---|---|---|
+| `bc1ffe9b…` | cancelled | 9851793766 | `master` |
+| `79f90fd0…` | cancelled | 9835956553 | `master` |
+| `ba520aa9…` | cancelled | — | `account_money` |
+| `fdc015eb…` | authorized | 9852888026 | `debvisa` |
+
+`bc1ffe9b…` es la suscripción 2 de `ESTADO.md`: autorizó, cobró una cuota de
+$2.500 y se canceló el 29/07. Trece días después sigue mostrando la tarjeta.
+Los otros seis cancelados de esa cuenta —los que crea y cancela
+`DiagnosticarAltaSuscripcion.ps1` sin que nadie los autorice— tienen los dos
+campos vacíos. El patrón cierra en las dos direcciones:
+
+```
+llegó a authorized  →  card_id / payment_method_id poblados, sobreviven a la baja
+nunca autorizó      →  los dos en null
+```
+
+Con el control positivo y el negativo medidos, los `null` de COT-36 significan
+lo que parecían significar: **nunca hubo tarjeta asociada.**
+
+### El contraste entre cuentas, sin depender de `billing.allow`
+
+| | Preapproval | Con medio de pago asociado |
+|---|---|---|
+| **Prueba** (3572201273) | 10 | **4** |
+| **Producción** (3521850855) | 9 | **0** |
+
+Mismo payload, mismo site MLU, mismo modelo `pending` → `init_point`. En una
+cuenta el checkout constituye el débito recurrente; en la otra, nueve de nueve
+veces, no.
+
+### Lo que NO se puede concluir de la ausencia de cobros
+
+`authorized_payments: 0` y `payments: 0` **no son indicio de error**. COT-36
+tenía `free_trial` de 15 días: la primera cuota no vencía hasta el 25/08. Ese
+dato es compatible con una suscripción correctamente autorizada y está además
+sobredeterminado —la suscripción murió a los 22 segundos—, así que no distingue
+nada. Un análisis anterior lo usó como evidencia; era incorrecto.
+
+Por lo mismo, `FechaAutorizacion IS NULL` en 9 de 9 prueba que **nunca
+observamos** `authorized`, no que nunca ocurrió. Lo que lo prueba es la tarjeta.
+
+### Herramientas
+
+- `Herramientas/ForensePreapproval.ps1` — sólo GET; imprime los campos que
+  deciden el punto de falla y acumula una línea temporal en JSONL.
+- `Database/12_ForenseUnaSuscripcion.sql` — la mitad local: fila, cuotas y
+  todas las notificaciones de una suscripción.
+
+### Hallazgos laterales de la misma medición
+
+- **MercadoPago responde `cancelled`, con dos eles**, tanto en el GET como en lo
+  que quedó en la base (7 filas con `MotivoCancelacion = 'Cancelada en
+  MercadoPago'`, que sólo se escribía comparando contra ese literal). Que
+  *acepte* `canceled` en el PUT no está verificado.
+- **`GET /preapproval` no devuelve `version` ni `payer_email`.** El `version` de
+  los webhooks saltó de 0 a 2: hubo una mutación intermedia que nunca se
+  notificó, y no se puede reconstruir. **Medido después sobre los 18 preapproval
+  (§2 quater): pasa en 15, pero los 3 que sí la emitieron fallaron igual. No
+  sirve como pista.**
+- **`payer_id` poblado no indica avance del checkout.** COT-16 está `pending`,
+  nunca autorizó, y también lo tiene: MercadoPago lo resuelve del `payer_email`
+  al crear.
+- **El reloj de `SERVER22\SQLSERVER2022` está 2 min 10 s adelantado.** El alta de
+  COT-36 fue a las 17:24:31 de Uruguay y la base anotó 17:26:41. Afecta
+  cualquier correlación entre nuestras fechas y las de MercadoPago.
+
+### Qué queda
+
+Todo lo verificable desde afuera está agotado, ahora con el punto de falla
+identificado. La pregunta para soporte es concreta: **por qué el checkout de
+suscripciones no completa la vinculación del medio de pago en la cuenta
+3521850855, si el mismo payload la completa en una cuenta de prueba.**
+
+---
+
+## 2 quater. Lo que se midió con el MCP conectado — 11/08/2026
+
+El MCP quedó conectado por OAuth contra la cuenta productiva. Tres mediciones,
+dos hipótesis descartadas y una pregunta nueva para soporte.
+
+### El historial de entregas de MercadoPago no sirve como prueba de ausencia
+
+`notifications_history` sobre la app 437871649677590 informa **25 entregas en el
+último mes, 25 exitosas, 0 fallidas, todas HTTP 200**, todas del tópico
+`subscription_preapproval`. Como prueba de que nuestro endpoint responde bien es
+excelente: es el log de ellos, no el nuestro.
+
+Como prueba de que *no* generaron algo, no sirve. La tabla local tiene **50
+notificaciones** en 31 días. El desglose plausible —23 de suscripciones nuestras
+y 26 del script de diagnóstico— encierra al 25 sin coincidir con ninguno, así
+que el historial no cubre todo lo que efectivamente recibimos. **No se puede
+argumentar "MercadoPago nunca lo emitió" apoyándose en él.**
+
+### El salto de `version` se descarta como pista
+
+Medido sobre los 18 preapproval con notificaciones: **en 15 falta la
+notificación intermedia** (`0 → 2`). Es el patrón dominante, no una anécdota del
+caso del ticket. Pero los tres que **sí** la emitieron terminaron igual:
+
+```
+58abfe8c…  COT-35  cancelled   0 → 1 → 2
+1141bdb1…  COT-35  cancelled   0 → 1 → 2
+```
+
+Las dos son de EmpleadoWeb contra la cuenta productiva. Recibir la notificación
+intermedia no cambió el desenlace, así que el hueco **no separa el caso que
+funciona del que no**. Se sacó del ticket: ofrecida como pista mandaba a soporte
+a investigar el pipeline de notificaciones, que no es donde está el problema.
+
+### La homologación no existe para Suscripciones
+
+`quality_checklist` sobre la app devuelve `Product not homologable`, y la
+documentación explica por qué: la herramienta de calidad *"solo está disponible
+para integraciones con Checkout Pro, Checkout API, Checkout Bricks y Mercado
+Pago Point"*. `form_homologation` con `product_id 28` (Subscription) devuelve
+`steps: []`.
+
+**"La aplicación no está homologada" queda descartado**: no es una puerta
+cerrada, es una puerta que no existe.
+
+### La pregunta nueva: "Etapa 1 de 5"
+
+El panel muestra la aplicación en *Estado: Etapa 1 de 5*, con los tres ítems de
+"Prueba tu integración" tildados y sin forma de avanzar. Coherente con lo
+anterior —las etapas siguientes son homologación y calidad, que para
+Suscripciones no aplican—, pero **no verificable desde afuera**: ningún endpoint
+devuelve la etapa.
+
+En contra de leerlo como "la app sigue en modo prueba" juega que esa cuenta ya
+liquidó dinero real (los 7 pagos de julio, con comisión y retenciones). A favor,
+que esos fueron Checkout Pro y no débito recurrente. Va como pregunta 4 del
+ticket.
+
+### El webhook del panel no aplica a Suscripciones
+
+Repetido en catorce páginas de la documentación: *"Este método de configuración
+no está disponible para integraciones con QR Code ni Suscripciones. Para
+configurar notificaciones con alguna de estas dos integraciones, utiliza el
+método Configuración durante la creación de un pago"*.
+
+Respalda el arreglo de §3.4 —mandar `notification_url` dentro del preapproval—.
+Queda una tensión anotada: antes de ese arreglo no se mandaba y las
+notificaciones llegaban igual, así que el panel empíricamente sí entrega
+`subscription_preapproval`. No confiar ciegamente en esa página.
+
+### El hueco del `Id` 29 — investigado y cerrado, no era un bug
+
+La fila de `8ef74c91` (COT-36, 10/08) no está, y el `Id` 29 falta en la
+secuencia. Se sospechó de la rama de la carrera del índice único
+(`SuscripcionServicio`), que es el único camino que consume un IDENTITY sin
+dejar fila **y** manda el único `PUT` de cancelación no pedido por un usuario.
+Habría significado que veníamos cancelando suscripciones de clientes y leyéndolo
+como "MercadoPago las cancela solas".
+
+**No fue eso.** El log del servidor lo dice literal:
+
+```
+Suscripción 29 creada para la cotización 36 (8ef74c91585845b3b72e985de1ee0e7a).
+Suscripción 8ef74c91… sincronizada. Estado: pending.
+Suscripción 8ef74c91… sincronizada. Estado: cancelled.
+```
+
+El insert prosperó, y no hay una sola línea de *"Alta rechazada por índice
+único"* en ningún log. La fila se borró a mano después —consistente con que la
+tabla arranque en `Id` 21 y con que `PagoUnico` tenga 0 filas y el IDENTITY en
+6—. La baja de `8ef74c91` la informó MercadoPago, igual que las demás, así que
+**§2 ter se sostiene**.
+
+Los preapproval huérfanos de esos días son los `DIAG-A/B/C/D` del script de
+diagnóstico. `b54d74ad` (COT-31) es de las filas `Id` ≤ 20 que se borraron.
+
+Dos cosas quedaron a la vista y valen aparte:
+
+- **Una notificación sin fila local se marca `Procesado = 1` con `ErrorProceso`
+  en NULL** ([`ProcesadorNotificaciones`](../src/TecnisegurMercadoPago.Api/Servicios/ProcesadorNotificaciones.cs)
+  loguea un warning y retorna normal). En la base es indistinguible de una que
+  actualizó bien; el único rastro está en el log de la aplicación. Nueve
+  preapproval pasaron por ahí sin dejar huella en la base.
+- **Se borran filas a mano en producción.** Es lo que hizo que este rastro
+  costara tres consultas y un log. Conviene decidir si se permite o no.
+
+### Herramientas de esta medición
+
+- `Herramientas/CruceNotificaciones.ps1` — ejecuta un SQL contra TSD y se niega
+  si el texto contiene verbos de escritura. Habilitado por ruta exacta en
+  `.claude/settings.local.json`.
+- `Database/14_CruceNotificacionesMp.sql` — el cruce entre lo que MercadoPago
+  dice que entregó y lo que quedó en la base, y la atribución de cada
+  preapproval a su fila local.
+
+---
+
+## 2 quinquies. El control que faltaba: es la cuenta, no la aplicación
+
+**Medido el 11/08/2026.** La objeción de §2 bis —que el experimento contra la
+cuenta de prueba cambiaba la cuenta *y* la aplicación al mismo tiempo— quedaba
+sin resolver. Se cerró creando una **segunda aplicación bajo la misma cuenta
+cobradora** y repitiendo el alta con sus credenciales de producción, de modo que
+la única variable que cambia sea la aplicación.
+
+```
+preapproval        085af30debdd43b2b3f425ba02432bc5
+application_id     709858592631421      ← distinta
+collector_id       3521850855           ← la misma
+date_created       2026-08-11T20:01:50.915Z
+last_modified      2026-08-11T20:02:37.792Z    (46,9 s)
+status             cancelled
+card_id            null
+payment_method_id  null
+billing.allow      true    codes: []
+```
+
+El comprador completó el checkout con tarjeta real y el resultado fue idéntico
+al de la aplicación productiva. Con eso la matriz queda cerrada:
+
+```
+misma app,  otra cuenta   →  autoriza
+otra app,   misma cuenta  →  falla
+```
+
+**La variable que determina el resultado es la cuenta cobradora 3521850855.**
+Ya no queda nada del lado de la integración por descartar.
+
+### Dos cosas que este experimento aclaró de paso
+
+- **La redirección al inicio de mercadopago.com no es señal de nada.** La
+  aplicación nueva tampoco tiene `callback_url` configurada, y produce la misma
+  pantalla. §2 bis la ofrecía como indicio de que "el flujo se corta a nivel de
+  aplicación"; no lo es, es el destino por defecto de una app sin URL de retorno.
+  En el ticket quedó como observación, no como argumento.
+- **El MCP no puede crear la aplicación.** `create_application` responde
+  `OAuth ownership validation failed`: la conexión sirve para leer pero no está
+  autenticada como aplicación OAuth. La app se creó a mano desde el panel.
+
+### Herramienta
+
+`Herramientas/AltaConOtraApp.ps1` — crea UN preapproval con el token de otra
+aplicación y lo deja vivo para poder autorizarlo (a diferencia de
+`DiagnosticarAltaSuscripcion.ps1`, que cancela todo lo que crea). Aborta si el
+token resulta ser de otra cuenta: con dos variables cambiadas la corrida no
+mide nada, y es preferible frenar que sacar una conclusión falsa.
+
+---
 
 ### El correo del checkout debe coincidir — trampa aparte, verificada
 
@@ -456,22 +741,28 @@ nunca "se mandó vacío".
 
 ## 5. Lo que queda pendiente
 
-- **Ejecutar `Database/11_TrazaAltaSuscripcion.sql`** en TSD. Sin eso el alta
-  falla: el `INSERT` referencia la columna nueva.
-- **Correr las consultas de higiene** para ver cuántas suscripciones `pending`
-  hay con la adhesión vencida. Es lo que confirma cuál de los defectos estuvo
-  actuando en producción.
+> Actualizado el 11/08. Los dos primeros puntos ya estaban hechos.
+
+- ~~Ejecutar `Database/11_TrazaAltaSuscripcion.sql`~~ — **ejecutado**. La columna
+  `PayloadEnvioJson` existe y COT-36 la tiene poblada.
+- ~~Correr las consultas de higiene~~ — **corridas**. Quedan dos suscripciones
+  `pending` abandonadas (COT-22 desde el 31/07, COT-16 desde el 04/08).
 - **Configurar `MercadoPago__CorreoCobrador`** en el `web.config` del servidor.
   Sin él la comprobación de pagador≠cobrador no corre — no rompe nada, pero se
   pierde un mensaje claro.
-- **Verificar `MercadoPago__BackUrl`** en el servidor. El valor que apareció en
-  el log del 31/07 (`https://www.tecnisegur.com.uy?cotizacion=31`) no coincide
-  con el que `DEPLOY.md` dice que debe estar
-  (`https://empleado.tecnisegur.com.uy/CotizacionAlarma/RetornoSuscripcion`).
+- **`MercadoPago__BackUrl`** — el requisito quedó definido el 11/08:
+  `https://www.tecnisegur.com.uy/`, sin ningún parámetro. `UrlRetorno` ya no
+  agrega `?cotizacion=N`; el valor del servidor sale normalizado con la barra
+  final. **No** se implementa `RetornoSuscripcion`: el retorno es sólo
+  navegación y la sincronización es enteramente server-side.
 - **Publicar** API y EmpleadoWeb — ver `DEPLOY.md` y `PENDIENTES.md` §1.
-- **El MCP de MercadoPago no está conectado.** `.mcp.json` referencia
-  `${MERCADOPAGO_MCP_TOKEN}` y esa variable no existe. La documentación citada
-  acá salió del sitio público de developers.
+- **Abrir el ticket con soporte de MercadoPago.** `TICKET-SOPORTE-MP.md` está
+  listo para copiar y pegar, con la evidencia de §2 ter y el control de
+  §2 quinquies. Es lo único que queda por hacer sobre este problema: del lado de
+  la integración no hay nada más que descartar.
+- ~~El MCP de MercadoPago no está conectado.~~ — **conectado el 11/08.**
+  `application_list` responde con la app 437871649677590. Lo que se pudo medir
+  con él está en §2 quater.
 
 Lo que sigue abierto en `PENDIENTES.md` no se tocó: cancelación de pagos únicos
 (§2), pool de IIS para el `BackgroundService` (§3bis.1), contracargos tardíos

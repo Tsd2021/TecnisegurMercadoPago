@@ -136,7 +136,7 @@ public sealed class SuscripcionServicio
             Reason = ArmarConcepto(solicitud.NombreCliente),
             ExternalReference = externalReference,
             PayerEmail = solicitud.PayerEmail.Trim(),
-            BackUrl = ArmarBackUrl(solicitud.IdCotizacion),
+            BackUrl = ArmarBackUrl(),
             NotificationUrl = ArmarNotificationUrl(),
             Status = "pending",
             AutoRecurring = new AutoRecurring
@@ -204,7 +204,8 @@ public sealed class SuscripcionServicio
                 "Carrera detectada en la cotización {Id}. Se cancela {Preapproval}.",
                 solicitud.IdCotizacion, respuesta.Id);
 
-            await CancelarEnMercadoPagoSilencioso(respuesta.Id, ct);
+            await CancelarEnMercadoPagoSilencioso(
+                respuesta.Id, solicitud.IdCotizacion, ct);
 
             throw new ReglaNegocioException(
                 "Otra operación creó la suscripción al mismo tiempo. " +
@@ -268,7 +269,7 @@ public sealed class SuscripcionServicio
                 "La suscripción no tiene identificador de MercadoPago.");
         }
 
-        if (suscripcion.Estado == "cancelled")
+        if (EstadoSuscripcion.EsCancelada(suscripcion.Estado))
         {
             throw new ReglaNegocioException(
                 "No se puede modificar el importe de una suscripción cancelada.");
@@ -286,14 +287,30 @@ public sealed class SuscripcionServicio
         return (await ObtenerAsync(idSuscripcion, ct))!;
     }
 
+    /// <summary>
+    /// Baja explícita, pedida por un usuario desde EmpleadoWeb o TSD. Es la
+    /// ÚNICA cancelación legítima del sistema, y la única además de la carrera
+    /// del índice único que llega a mandar un PUT.
+    ///
+    /// <paramref name="origen"/> identifica al sistema llamador
+    /// (X-Api-Key → SistemaLlamador) y queda en el rastro de auditoría junto
+    /// con el estado que tenía la suscripción antes de tocarla.
+    ///
+    /// Ya cancelada devuelve el estado sin llamar a MercadoPago: la operación
+    /// es idempotente, refrescar la pantalla o repetir el pedido no vuelve a
+    /// mutar nada.
+    /// </summary>
     public async Task<SuscripcionEstadoDto> CancelarAsync(
-        int idSuscripcion, string? motivo, CancellationToken ct = default)
+        int idSuscripcion,
+        string? motivo,
+        string? origen = null,
+        CancellationToken ct = default)
     {
         var suscripcion = await _repositorio.ObtenerPorIdAsync(idSuscripcion, ct)
             ?? throw new ReglaNegocioException(
                 $"No existe la suscripción {idSuscripcion}.");
 
-        if (suscripcion.Estado == "cancelled")
+        if (EstadoSuscripcion.EsCancelada(suscripcion.Estado))
             return (await ObtenerAsync(idSuscripcion, ct))!;
 
         if (string.IsNullOrWhiteSpace(suscripcion.PreapprovalId))
@@ -302,16 +319,67 @@ public sealed class SuscripcionServicio
                 "La suscripción no tiene identificador de MercadoPago.");
         }
 
-        await _mercadoPago.CancelarSuscripcionAsync(suscripcion.PreapprovalId, ct);
+        /* El estado que MercadoPago tiene AHORA, antes de que lo pisemos. Es el
+           dato que después permite decir si la baja cortó un cobro vivo o cerró
+           un link que nadie había autorizado. Nunca lanza: no vale la pena
+           frustrar una baja pedida por un usuario porque falló una consulta. */
+        var estadoRemoto = await ConsultarEstadoRemotoAsync(
+            suscripcion.PreapprovalId, ct);
 
+        var correlacion = AuditoriaPreapproval.Correlacion();
+
+        AuditoriaPreapproval.Emitida(
+            _log,
+            operacion: "CANCELAR",
+            origen: $"{AuditoriaPreapproval.Origen.CancelacionExplicita}:{origen ?? "desconocido"}",
+            preapprovalId: suscripcion.PreapprovalId,
+            externalReference: suscripcion.ExternalReference,
+            idCotizacion: suscripcion.IdCotizacion,
+            estadoLocalAnterior: suscripcion.Estado,
+            estadoRemotoAnterior: estadoRemoto,
+            estadoNuevo: EstadoSuscripcion.Cancelada,
+            detalle: motivo,
+            correlacion: correlacion);
+
+        await _mercadoPago.CancelarSuscripcionAsync(
+            suscripcion.PreapprovalId,
+            $"{AuditoriaPreapproval.Origen.CancelacionExplicita}:{origen ?? "desconocido"} " +
+            $"(correlacion={correlacion})",
+            ct);
+
+        /* Se guarda el valor de CONTRATO, no el canónico: TSD y EmpleadoWeb
+           comparan contra 'cancelled' y no pasan por acá. Ver EstadoSuscripcion. */
         await _repositorio.ActualizarEstadoAsync(
-            suscripcion.PreapprovalId, "cancelled", null,
+            suscripcion.PreapprovalId, EstadoSuscripcion.CanceladaContrato, null,
             motivo ?? "Cancelada desde el sistema", ct);
 
         _log.LogInformation("Suscripción {Id} cancelada. Motivo: {Motivo}",
             idSuscripcion, motivo);
 
         return (await ObtenerAsync(idSuscripcion, ct))!;
+    }
+
+    /// <summary>
+    /// Estado actual del preapproval en MercadoPago, o null si no se pudo
+    /// averiguar. Se usa sólo para auditoría y para la guarda de la carrera:
+    /// en ninguno de los dos casos un fallo de red debe cortar la operación.
+    /// </summary>
+    private async Task<string?> ConsultarEstadoRemotoAsync(
+        string preapprovalId, CancellationToken ct)
+    {
+        try
+        {
+            var remota = await _mercadoPago.ObtenerSuscripcionAsync(preapprovalId, ct);
+            return remota.Status;
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "No se pudo leer el estado del preapproval {Preapproval} en " +
+                "MercadoPago antes de mutarlo.", preapprovalId);
+
+            return null;
+        }
     }
 
     /// <summary>
@@ -336,9 +404,21 @@ public sealed class SuscripcionServicio
         var remota = await _mercadoPago
             .ObtenerSuscripcionAsync(suscripcion.PreapprovalId, ct);
 
+        /* Sincronizar COPIA el estado de MercadoPago; nunca lo decide. Queda
+           auditado con la misma línea que el webhook para que la reconstrucción
+           de "quién cambió qué" no dependa de por dónde entró el cambio. */
+        AuditoriaPreapproval.Recibida(
+            _log,
+            suscripcion.PreapprovalId,
+            remota.ExternalReference ?? suscripcion.ExternalReference,
+            suscripcion.IdCotizacion,
+            suscripcion.Estado,
+            remota.Status,
+            AuditoriaPreapproval.Correlacion());
+
         await _repositorio.ActualizarEstadoAsync(
             suscripcion.PreapprovalId,
-            remota.Status ?? suscripcion.Estado!,
+            EstadoSuscripcion.ParaPersistir(remota.Status ?? suscripcion.Estado!),
             remota.NextPaymentDate?.LocalDateTime,
             null,
             ct);
@@ -553,9 +633,9 @@ public sealed class SuscripcionServicio
     /// responde 400 si recibe "". El armado en sí vive en UrlRetorno, que lo
     /// comparte con los pagos únicos.
     /// </summary>
-    private string? ArmarBackUrl(int idCotizacion)
+    private string? ArmarBackUrl()
     {
-        var url = UrlRetorno.ConCotizacion(_opciones.BackUrl, idCotizacion);
+        var url = UrlRetorno.Normalizada(_opciones.BackUrl);
 
         if (url is null)
         {
@@ -581,12 +661,62 @@ public sealed class SuscripcionServicio
             ? null
             : _opciones.UrlWebhook.Trim();
 
+    /// <summary>
+    /// Cancela la suscripción que acaba de crearse cuando el índice único
+    /// rechazó su insert. Es el ÚNICO PUT de cancelación que este sistema manda
+    /// sin que un usuario lo pida, así que lleva dos protecciones.
+    ///
+    /// La primera es la guarda de estado: la suscripción huérfana tiene
+    /// segundos de vida y no puede estar en otra cosa que "pending". Si
+    /// MercadoPago informa cualquier otro estado, el supuesto de esta rama —que
+    /// se está limpiando un sobrante que nadie autorizó— no se cumple, y se
+    /// prefiere dejar el preapproval vivo para limpieza manual antes que
+    /// arriesgarse a cortarle el cobro a un cliente que ya puso la tarjeta.
+    /// Recuperar una suscripción cancelada no se puede; borrar una huérfana a
+    /// mano sí.
+    ///
+    /// La segunda es el rastro de auditoría, que deja escrito que la baja salió
+    /// de acá y no de MercadoPago.
+    /// </summary>
     private async Task CancelarEnMercadoPagoSilencioso(
-        string preapprovalId, CancellationToken ct)
+        string preapprovalId, int idCotizacion, CancellationToken ct)
     {
+        var correlacion = AuditoriaPreapproval.Correlacion();
+        var estadoRemoto = await ConsultarEstadoRemotoAsync(preapprovalId, ct);
+
+        if (estadoRemoto is not null and not "pending")
+        {
+            _log.LogError(
+                "AUDITORIA-PREAPPROVAL {InstanteUtc:o} operacion=CANCELAR " +
+                "direccion=ABORTADA origen={Origen} preapproval={Preapproval} " +
+                "estado_remoto_anterior={EstadoRemoto} cotizacion={Cotizacion} " +
+                "correlacion={Correlacion} — NO se cancela: la suscripción no " +
+                "está 'pending'. Revisar a mano si quedó huérfana.",
+                DateTime.UtcNow, AuditoriaPreapproval.Origen.CarreraIndiceUnico,
+                preapprovalId, estadoRemoto, idCotizacion, correlacion);
+
+            return;
+        }
+
+        AuditoriaPreapproval.Emitida(
+            _log,
+            operacion: "CANCELAR",
+            origen: AuditoriaPreapproval.Origen.CarreraIndiceUnico,
+            preapprovalId: preapprovalId,
+            externalReference: $"COT-{idCotizacion}",
+            idCotizacion: idCotizacion,
+            estadoLocalAnterior: "(sin fila: el insert fue rechazado)",
+            estadoRemotoAnterior: estadoRemoto,
+            estadoNuevo: "cancelled",
+            detalle: "El índice único rechazó el insert; se limpia el sobrante.",
+            correlacion: correlacion);
+
         try
         {
-            await _mercadoPago.CancelarSuscripcionAsync(preapprovalId, ct);
+            await _mercadoPago.CancelarSuscripcionAsync(
+                preapprovalId,
+                $"{AuditoriaPreapproval.Origen.CarreraIndiceUnico} (correlacion={correlacion})",
+                ct);
         }
         catch (Exception ex)
         {

@@ -118,7 +118,7 @@ function Probar {
         try {
             Invoke-RestMethod -Uri "https://api.mercadopago.com/preapproval/$($r.id)" `
                 -Method Put -Headers $cabeceras -ContentType 'application/json' `
-                -Body (@{ status = 'cancelled' } | ConvertTo-Json) | Out-Null
+                -Body (@{ status = 'canceled' } | ConvertTo-Json) | Out-Null
             Write-Host "  cancelado" -ForegroundColor DarkGray
             $script:creados = $script:creados | Where-Object { $_ -ne $r.id }
         }

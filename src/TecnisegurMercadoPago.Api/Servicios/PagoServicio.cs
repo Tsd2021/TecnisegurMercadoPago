@@ -89,7 +89,7 @@ public sealed class PagoServicio
             }
         };
 
-        AplicarBackUrls(preferencia, solicitud.IdCotizacion);
+        AplicarBackUrls(preferencia);
 
         /* -------------------------------------------------------------------
          * 2) Crear la preferencia. Si falla se libera la reserva: de lo
@@ -271,9 +271,9 @@ public sealed class PagoServicio
     /// responde 400 si recibe uno sin el otro. Sin BackUrl configurada se
     /// omiten los dos y el cliente simplemente se queda en MercadoPago.
     /// </summary>
-    private void AplicarBackUrls(PreferenciaSolicitud preferencia, int idCotizacion)
+    private void AplicarBackUrls(PreferenciaSolicitud preferencia)
     {
-        var url = UrlRetorno.ConCotizacion(_opciones.BackUrl, idCotizacion);
+        var url = UrlRetorno.Normalizada(_opciones.BackUrl);
 
         if (url is null)
         {

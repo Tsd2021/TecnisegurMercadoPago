@@ -154,11 +154,31 @@ public sealed class MercadoPagoCliente
             ct);
     }
 
+    /// <summary>
+    /// La ÚNICA vía por la que este sistema puede cancelar un preapproval.
+    /// Todo lo que la llame queda en el log con su origen: ver
+    /// <see cref="AuditoriaPreapproval"/>.
+    ///
+    /// Manda <see cref="EstadoSuscripcion.Cancelada"/> —<c>canceled</c>, una
+    /// sola ele—, que es lo que documenta MercadoPago hoy. Antes iba
+    /// <c>cancelled</c> y también funcionaba; el cambio alinea el valor con la
+    /// documentación vigente en vez de depender de que sigan aceptando el
+    /// sinónimo.
+    ///
+    /// <paramref name="origen"/> es obligatorio a propósito. Sin él una
+    /// cancelación futura volvería a ser anónima, que es justamente lo que
+    /// costó días de diagnóstico.
+    /// </summary>
     public Task<PreapprovalRespuesta> CancelarSuscripcionAsync(
         string preapprovalId,
+        string origen,
         CancellationToken ct = default)
     {
-        var cuerpo = new PreapprovalActualizacion { Status = "cancelled" };
+        var cuerpo = new PreapprovalActualizacion { Status = EstadoSuscripcion.Cancelada };
+
+        _log.LogWarning(
+            "Cancelando el preapproval {Preapproval} en MercadoPago. Origen: {Origen}.",
+            preapprovalId, origen);
 
         return EnviarAsync<PreapprovalRespuesta>(
             HttpMethod.Put,
@@ -335,6 +355,23 @@ public sealed class MercadoPagoCliente
 
             peticion.Content = new StringContent(
                 cuerpoJson, Encoding.UTF8, "application/json");
+        }
+
+        /* -------------------------------------------------------------------
+         * Red de arrastre: toda llamada que PUEDE modificar algo en
+         * MercadoPago queda registrada, la haya escrito quien la haya escrito.
+         * Los métodos con nombre (CancelarSuscripcionAsync, etc.) ya emiten su
+         * propia auditoría, pero eso depende de que quien agregue una ruta
+         * nueva se acuerde. Esto no depende de nadie.
+         *
+         * No se registra el access token: viaja en el header Authorization,
+         * que no se toca acá.
+         * ------------------------------------------------------------------- */
+        if (metodo != HttpMethod.Get)
+        {
+            _log.LogInformation(
+                "MercadoPago (mutación) {Metodo} {Ruta}. Cuerpo: {Cuerpo}. Correlación: {Correlacion}",
+                metodo, ruta, Resumir(cuerpoJson), AuditoriaPreapproval.Correlacion());
         }
 
         using var respuesta = await _http.SendAsync(peticion, ct);
