@@ -650,11 +650,26 @@ public sealed class SuscripcionServicio
     }
 
     /// <summary>
-    /// El webhook configurado en el panel ya cubre las suscripciones, pero
-    /// mandarlo también en el preapproval lo deja atado a esta suscripción en
-    /// particular: si alguien toca la configuración del panel, las que ya
-    /// existen siguen notificando. Mismo criterio que PagoServicio con las
-    /// preferencias de Checkout Pro.
+    /// Se manda por prolijidad y porque la documentación lo pide, pero
+    /// <b>MercadoPago lo descarta</b>: lo que decide si una suscripción notifica
+    /// es el webhook configurado en el panel de la aplicación, y nada más.
+    ///
+    /// NO ES UNA RED DE SEGURIDAD. La versión anterior de este comentario decía
+    /// que mandarlo dejaba la suscripción atada a su propia URL, de modo que
+    /// tocar el panel no afectara a las ya creadas. Es falso, y creerlo es
+    /// peligroso: si alguien cambia la configuración del panel, las
+    /// suscripciones existentes dejan de notificar y la conciliación de cobros
+    /// se corta sin ningún error visible.
+    ///
+    /// Medido el 11/08/2026 (ANALISIS-COBROS.md §2 quater): un preapproval
+    /// creado con este campo queda con <c>notification_url</c> vacío en el GET
+    /// mientras sigue en <c>pending</c> —o sea que no es el vaciado de campos de
+    /// una baja—, y ninguna de sus notificaciones llega. Las aplicaciones sin
+    /// webhook en el panel no entregan nada: verificado contra dos, la de la
+    /// cuenta de prueba y una segunda de la cuenta productiva.
+    ///
+    /// CONSECUENCIA OPERATIVA: si alguna vez se migra a otra aplicación, hay que
+    /// configurarle el webhook en el panel ANTES de mover el access token.
     /// </summary>
     private string? ArmarNotificationUrl()
         => string.IsNullOrWhiteSpace(_opciones.UrlWebhook)

@@ -451,17 +451,48 @@ liquidó dinero real (los 7 pagos de julio, con comisión y retenciones). A favo
 que esos fueron Checkout Pro y no débito recurrente. Va como pregunta 4 del
 ticket.
 
-### El webhook del panel no aplica a Suscripciones
+### El `notification_url` del preapproval no sirve para nada — y §3.4 lo daba por bueno
 
-Repetido en catorce páginas de la documentación: *"Este método de configuración
-no está disponible para integraciones con QR Code ni Suscripciones. Para
-configurar notificaciones con alguna de estas dos integraciones, utiliza el
-método Configuración durante la creación de un pago"*.
+La documentación dice, repetido en catorce páginas: *"Este método de
+configuración no está disponible para integraciones con QR Code ni
+Suscripciones. Para configurar notificaciones con alguna de estas dos
+integraciones, utiliza el método Configuración durante la creación de un pago"*.
 
-Respalda el arreglo de §3.4 —mandar `notification_url` dentro del preapproval—.
-Queda una tensión anotada: antes de ese arreglo no se mandaba y las
-notificaciones llegaban igual, así que el panel empíricamente sí entrega
-`subscription_preapproval`. No confiar ciegamente en esa página.
+**Es al revés.** Medido el 11/08 con tres pruebas independientes:
+
+| Aplicación | Webhook en el panel | Notificaciones |
+|---|---|---|
+| 437871649677590 (productiva) | sí | 25 de 25 entregadas |
+| 709858592631421 (segunda productiva) | no | historial vacío |
+| 2447216447432403 (cuenta de prueba) | no | ninguna |
+
+Las tres mandaron `notification_url` en el POST. La regla real es una sola:
+
+> Notifica **sólo** la aplicación que tiene el webhook configurado en el panel.
+> El `notification_url` del payload MercadoPago lo descarta.
+
+La prueba de que lo descarta y no que simplemente el GET no lo devuelve: el
+preapproval `6b7133c7d6b44cb79af81c916168c36c`, creado con el campo, quedó con
+`notification_url` vacío **estando en `pending`**. No es el vaciado de campos
+que hace una baja. Queda un fleco: `498c7bbb` —creado por la app productiva— sí
+lo devuelve en el GET, lo que sugiere que MercadoPago sólo lo acepta cuando la
+aplicación ya tiene notificaciones habilitadas.
+
+Esto también disuelve una contradicción que quedaba anotada: los preapproval
+`DIAG-*` del 10/08 notificaron porque eran de **producción**, no de la cuenta de
+prueba. `GET /preapproval/63c894da…` con el token de prueba devuelve
+`BadRequest`.
+
+**Lo que hay que corregir de §3.4.** El comentario de `ArmarNotificationUrl`
+afirmaba que mandar el campo dejaba a cada suscripción atada a su propia URL, de
+modo que tocar el panel no afectara a las ya creadas. No existe esa red: si
+alguien cambia la configuración del panel, las suscripciones vivas dejan de
+notificar y la conciliación se corta sin ningún error visible. El comentario ya
+está corregido en el código.
+
+**Consecuencia operativa:** migrar de aplicación exige configurarle el webhook en
+el panel **antes** de mover el access token. Si no, los cobros se dejan de
+conciliar en silencio — que es el peor modo de falla posible acá.
 
 ### El hueco del `Id` 29 — investigado y cerrado, no era un bug
 

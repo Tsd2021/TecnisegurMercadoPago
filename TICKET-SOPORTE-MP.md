@@ -185,9 +185,11 @@ Concretamente, si pueden revisar de su lado:
    llegado a `authorized`.
 4. El panel muestra la aplicación 437871649677590 en **"Estado: Etapa 1 de 5"**,
    con los tres ítems de *"Prueba tu integración"* completos y sin forma de
-   avanzar. ¿Ese estado limita de alguna manera la constitución de débitos
-   recurrentes en producción, o es un recorrido que no aplica a las
-   integraciones de Suscripciones?
+   avanzar. Entendemos que el recorrido no aplica —en *Tus integraciones* la
+   misma aplicación figura como *"Medición no disponible: sólo habilitada para
+   Checkout Pro, Checkout API, Checkout Bricks y Mercado Pago Point"*—, pero
+   queremos confirmarlo: **¿ese estado limita de alguna manera la constitución
+   de débitos recurrentes en producción?**
 
 Quedamos a disposición para cualquier dato adicional. Podemos reproducirlo
 cuando lo necesiten.

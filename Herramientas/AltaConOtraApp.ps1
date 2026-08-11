@@ -58,6 +58,7 @@ param(
     [string] $ExternalReference = 'COT-36',
     [decimal] $Monto            = 15.00,
     [int]    $DiasPrueba        = 15,
+    [long]   $CuentaEsperada    = 3521850855,
     [string] $Cancelar
 )
 
@@ -74,7 +75,18 @@ if ($Pedir -and -not $AccessToken) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($puntero) }
 }
 
-if (-not $AccessToken) { throw "Falta el access token. Usar -Pedir o -AccessToken." }
+if (-not $AccessToken) {
+    Write-Host "Leyendo el access token de user-secrets..." -ForegroundColor DarkGray
+
+    $proyecto = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\TecnisegurMercadoPago.Api'
+    $secretos = dotnet user-secrets list --project $proyecto
+    $linea    = $secretos | Where-Object { $_ -like 'MercadoPago:AccessToken*' }
+
+    if (-not $linea) {
+        throw "No se encontro 'MercadoPago:AccessToken' en user-secrets. Pasalo con -AccessToken o -Pedir."
+    }
+    $AccessToken = ($linea -split '=', 2)[1].Trim()
+}
 
 $cabeceras = @{ Authorization = "Bearer $AccessToken" }
 
@@ -85,8 +97,6 @@ $cabeceras = @{ Authorization = "Bearer $AccessToken" }
 #    otra cuenta, vuelve a cambiar dos variables a la vez y la corrida no mide
 #    nada. Mejor frenar que sacar una conclusion falsa.
 # ---------------------------------------------------------------------------
-$CuentaEsperada = 3521850855
-
 $yo = Invoke-RestMethod -Uri 'https://api.mercadopago.com/users/me' -Headers $cabeceras
 Write-Host ""
 Write-Host ("Cuenta   : {0}  ({1})" -f $yo.id, $yo.nickname)
