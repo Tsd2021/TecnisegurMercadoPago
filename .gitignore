@@ -26,3 +26,7 @@ appsettings.Production.json
 
 ## Reportes descargados de MercadoPago — datos financieros de la cuenta
 Herramientas/reportes/
+
+## Claude Code — configuración local de cada máquina (rutas y aprobaciones
+## propias del usuario). El agente, las skills y los comandos sí se versionan.
+.claude/settings.local.json
