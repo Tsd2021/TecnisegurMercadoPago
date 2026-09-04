@@ -55,6 +55,23 @@ public sealed class MercadoPagoOpciones
     public string CorreoCobrador { get; set; } = string.Empty;
 
     /// <summary>
+    /// Habilita el repaso diario que restituye el importe pleno cuando el
+    /// descuento de una cotización vence (ver
+    /// Database/18_DescuentosVencidos.sql).
+    ///
+    /// <b>Arranca apagada a propósito.</b> Cada fila que toca es un cliente al
+    /// que se le sube la cuota sin que él haya hecho nada, y la primera corrida
+    /// alcanza de una vez a todos los descuentos vencidos acumulados. Con la
+    /// bandera en false el repaso igual corre y deja en el log exactamente lo
+    /// que haría, sin llamar a MercadoPago: eso permite revisar la lista antes
+    /// de mover plata.
+    ///
+    /// La misma lista se puede mirar en SQL con
+    /// SELECT * FROM dbo.vw_SuscripcionesDescuentoVencido.
+    /// </summary>
+    public bool RestituirDescuentosVencidos { get; set; }
+
+    /// <summary>
     /// Consultar GET /users/me antes de dar de alta una suscripción y rechazar
     /// si la cuenta tiene la facturación bloqueada.
     ///

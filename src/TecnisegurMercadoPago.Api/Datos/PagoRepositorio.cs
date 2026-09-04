@@ -217,6 +217,69 @@ public sealed class PagoRepositorio
     }
 
     /// <summary>
+    /// El cobro pendiente de una cotización, si lo hay.
+    ///
+    /// Es el que ocupa el índice único filtrado y el que hay que resolver antes
+    /// de poder generar otro link para la misma cotización. Puede haber uno
+    /// solo por definición del índice, así que no hace falta desempatar.
+    /// </summary>
+    public async Task<PagoUnicoDto?> ObtenerPendientePorCotizacionAsync(
+        int idCotizacion, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT * FROM dbo.vw_PagosUnicosEstado
+            WHERE IdCotizacion = @IdCotizacion
+              AND Estado = 'pendiente';";
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@IdCotizacion", SqlDbType.Int).Value = idCotizacion;
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct) ? Mapear(reader) : null;
+    }
+
+    /// <summary>
+    /// Marca cancelado un cobro que sigue pendiente, para que deje de bloquear
+    /// el índice y se pueda generar otro link para la misma cotización.
+    ///
+    /// El UPDATE exige que siga en 'pendiente'. Devuelve false si ya no lo
+    /// estaba —se acreditó, se rechazó, o alguien lo canceló mientras tanto— y
+    /// en ese caso no toca nada: cancelar un cobro ya acreditado sería borrar
+    /// plata que entró.
+    ///
+    /// Queda en 'cancelled', con dos eles, que es el literal de MercadoPago y el
+    /// que las vistas ya traducen como "Cancelado". Inventar un estado propio
+    /// obligaría a tocar vw_PagosUnicosEstado, vw_CobranzasMercadoPago y la
+    /// lista blanca del módulo de TSD para expresar lo mismo. El porqué de la
+    /// cancelación va en EstadoDetalle, que para eso está.
+    /// </summary>
+    public async Task<bool> CancelarPendienteAsync(
+        int idPago, string? motivo, CancellationToken ct = default)
+    {
+        const string sql = @"
+            UPDATE dbo.PagoUnico
+               SET Estado             = 'cancelled',
+                   EstadoDetalle      = @Motivo,
+                   FechaActualizacion = GETDATE()
+             WHERE Id     = @Id
+               AND Estado = 'pendiente';";
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Id", SqlDbType.Int).Value = idPago;
+
+        cmd.Parameters.Add("@Motivo", SqlDbType.VarChar, 100).Value =
+            (object?)motivo ?? DBNull.Value;
+
+        return await cmd.ExecuteNonQueryAsync(ct) == 1;
+    }
+
+    /// <summary>
     /// Registra el resultado del cobro que llegó por webhook.
     ///
     /// Se busca por ExternalReference, que es la única pista que trae el pago.
@@ -252,7 +315,14 @@ public sealed class PagoRepositorio
                 EstadoDetalle      = @EstadoDetalle,
                 Monto              = ISNULL(@Monto, Monto),
                 Moneda             = ISNULL(@Moneda, Moneda),
-                FechaPago          = @FechaPago,
+                /* ISNULL como sus vecinas, y por el mismo motivo: MercadoPago
+                   sólo informa date_approved mientras el pago está aprobado. Si
+                   después pasa a in_mediation o refunded lo manda vacío, y
+                   escribirlo verbatim borra la fecha real del cobro. Verificado
+                   con el pago 173370259108 el 12/08/2026: se acreditó 11:15:19 y
+                   la notificación de mediación de 14 minutos después dejó la
+                   columna en NULL. Perder el dato es peor que no actualizarlo. */
+                FechaPago          = ISNULL(@FechaPago, FechaPago),
                 PayloadJson        = @Payload,
                 FechaLiberacion    = ISNULL(@FechaLiberacion, FechaLiberacion),
                 MontoNeto          = ISNULL(@MontoNeto, MontoNeto),

@@ -3,20 +3,24 @@ namespace TecnisegurMercadoPago.Api.Servicios;
 /// <summary>
 /// Los estados de un preapproval, en un solo lugar.
 ///
-/// EXISTE POR LA DOBLE ORTOGRAFÍA DE "CANCELADA". La documentación actual de
+/// EXISTE POR LA DOBLE ORTOGRAFÍA DE "CANCELADA". La documentación de
 /// MercadoPago para dar de baja una suscripción usa <c>canceled</c> —una sola
-/// ele—, mientras que este sistema mandó <c>cancelled</c> desde el principio y
-/// MercadoPago lo aceptó (verificado el 29/07/2026: la baja se completó y MP
-/// emitió su propia notificación por ella). No sabemos si acepta las dos o si
-/// una quedó como sinónimo histórico, y tampoco sabemos con cuál responde el
-/// GET. Mientras eso siga abierto, comparar contra un literal suelto es una
-/// bomba de tiempo silenciosa: no falla, simplemente deja de reconocer el
-/// estado.
+/// ele—, pero la API **no lo acepta**: medido el 02/09/2026 contra producción,
+/// el <c>PUT</c> responde <c>400 "invalid preapproval status parm canceled"</c>.
+/// Lo que funciona es <c>cancelled</c>, con dos eles, que es lo que este
+/// sistema mandó desde el principio (verificado también el 29/07/2026).
 ///
-/// De ahí los DOS valores para lo mismo, que no es una inconsistencia sino la
-/// frontera entre lo que decidimos nosotros y lo que ya está desplegado:
+/// MercadoPago sí *responde* <c>cancelled</c> en el GET y en sus
+/// notificaciones. Aun así, comparar contra un literal suelto sigue siendo una
+/// bomba de tiempo silenciosa —no falla, simplemente deja de reconocer el
+/// estado— y por eso la normalización se mantiene.
 ///
-///   <see cref="Cancelada"/>          "canceled"   — canónico interno y saliente
+/// De ahí los valores separados, que no son una inconsistencia sino la
+/// frontera entre lo interno, lo que viaja a MercadoPago y lo que ya está
+/// desplegado en otros sistemas:
+///
+///   <see cref="Cancelada"/>          "canceled"   — canónico SÓLO interno
+///   <see cref="CanceladaSaliente"/>  "cancelled"  — lo que acepta MercadoPago
 ///   <see cref="CanceladaContrato"/>  "cancelled"  — lo que se persiste
 ///
 /// <b>El valor persistido NO se puede cambiar sin republicar TSD y
@@ -43,8 +47,12 @@ public static class EstadoSuscripcion
     public const string Pausada = "paused";
 
     /// <summary>
-    /// Valor canónico interno y el que se le manda a MercadoPago.
-    /// Una sola ele, como la documentación vigente.
+    /// Valor canónico INTERNO, el que devuelve <see cref="Normalizar"/> para
+    /// poder comparar sin importar con qué ortografía llegue el estado.
+    /// Una sola ele.
+    ///
+    /// <b>No es el que se le manda a MercadoPago</b>: para eso está
+    /// <see cref="CanceladaSaliente"/>. Ver ahí por qué.
     /// </summary>
     public const string Cancelada = "canceled";
 
@@ -53,6 +61,24 @@ public static class EstadoSuscripcion
     /// EmpleadoWeb. Dos eles. No tocar sin republicar los dos sistemas.
     /// </summary>
     public const string CanceladaContrato = "cancelled";
+
+    /// <summary>
+    /// El que acepta MercadoPago en el <c>PUT /preapproval/{id}</c>. Dos eles.
+    ///
+    /// <b>MEDIDO el 02/09/2026 contra producción</b>, cancelando desde TSD la
+    /// suscripción de la cotización 45: con <c>canceled</c> —una sola ele, que
+    /// es lo que dice la documentación— MercadoPago responde
+    /// <c>400 "invalid preapproval status parm canceled"</c>. Con
+    /// <c>cancelled</c> funciona, y es lo que este sistema mandó desde el
+    /// principio (verificado también el 29/07/2026).
+    ///
+    /// O sea que la documentación y la API no coinciden. Manda la API. Es un
+    /// alias de <see cref="CanceladaContrato"/> y no un literal nuevo, porque
+    /// son el mismo valor; existe aparte para que el día que MercadoPago
+    /// arregle la documentación se vea de un vistazo cuál de los dos usos hay
+    /// que revisar.
+    /// </summary>
+    public const string CanceladaSaliente = CanceladaContrato;
 
     /// <summary>
     /// Lleva cualquier ortografía de "cancelada" al valor canónico. El resto de

@@ -245,6 +245,18 @@ public sealed class CrearPagoSolicitud
     /// Si viene, el link se manda por WhatsApp apenas se crea el cobro.
     /// </summary>
     public string? Telefono { get; set; }
+
+    /// <summary>
+    /// Reemplaza el cobro pendiente de la cotización, si lo hay: lo cancela
+    /// —venciendo además su link en MercadoPago— y crea el nuevo.
+    ///
+    /// Va en false por defecto a propósito. Sin esta bandera, un segundo intento
+    /// para la misma cotización se rechaza, que es lo que impide que un doble
+    /// click deje dos links vivos. Ponerla en true es afirmar que el reemplazo
+    /// es deliberado: el caso típico es volver a cobrarle al mismo cliente el
+    /// mes siguiente cuando el link anterior quedó sin pagar.
+    /// </summary>
+    public bool ReemplazarPendiente { get; set; }
 }
 
 public sealed class CrearPagoRespuesta

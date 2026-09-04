@@ -14,6 +14,20 @@ public sealed record CuotaAReconsultar(
     string PaymentId);
 
 /// <summary>
+/// Suscripción viva que sigue cobrando un importe con descuento ya vencido.
+/// La produce vw_SuscripcionesDescuentoVencido; la consume el repaso diario de
+/// <see cref="Servicios.ProcesadorNotificaciones"/>.
+/// </summary>
+public sealed record SuscripcionConDescuentoVencido(
+    int IdSuscripcion,
+    int IdCotizacion,
+    string? NombreCliente,
+    decimal MontoActual,
+    decimal MontoPleno,
+    decimal Porcentaje,
+    DateTime FechaVencimiento);
+
+/// <summary>
 /// Acceso a datos de suscripciones y cuotas. ADO.NET directo, siguiendo la
 /// convención del resto de los sistemas (TecnisegurApi, EmpleadoWeb):
 /// sin ORM, parámetros siempre tipados, conexión dentro de un using.
@@ -390,6 +404,53 @@ public sealed class SuscripcionRepositorio
                 reader.GetInt32(reader.GetOrdinal("IdSuscripcion")),
                 Texto(reader, "MpAuthorizedPaymentId"),
                 Texto(reader, "MpPaymentId")!));
+        }
+
+        return lista;
+    }
+
+    /// <summary>
+    /// Suscripciones vivas cuyo descuento ya venció y que siguen cobrando el
+    /// importe rebajado.
+    ///
+    /// Toda la regla —cuál descuento cuenta, cuándo se considera vencido, cuál
+    /// es el importe pleno— vive en vw_SuscripcionesDescuentoVencido, no acá.
+    /// Es a propósito: la API no calcula descuentos, sólo relaya el monto que
+    /// corresponde. Ver Database/18_DescuentosVencidos.sql.
+    ///
+    /// El tope existe por lo mismo que el del repaso de liberaciones: cada fila
+    /// es un PUT contra MercadoPago, y una corrida no debería poder disparar
+    /// cientos de llamadas de golpe.
+    /// </summary>
+    public async Task<List<SuscripcionConDescuentoVencido>> ListarDescuentosVencidosAsync(
+        int tope = 100, CancellationToken ct = default)
+    {
+        const string sql = @"
+            SELECT TOP (@Tope)
+                   IdSuscripcion, IdCotizacion, NombreCliente,
+                   MontoActual, MontoPleno, Porcentaje, FechaVencimiento
+            FROM dbo.vw_SuscripcionesDescuentoVencido
+            ORDER BY FechaVencimiento;";
+
+        var lista = new List<SuscripcionConDescuentoVencido>();
+
+        await using var cn = Conexion();
+        await cn.OpenAsync(ct);
+
+        await using var cmd = new SqlCommand(sql, cn);
+        cmd.Parameters.Add("@Tope", SqlDbType.Int).Value = tope;
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            lista.Add(new SuscripcionConDescuentoVencido(
+                reader.GetInt32(reader.GetOrdinal("IdSuscripcion")),
+                reader.GetInt32(reader.GetOrdinal("IdCotizacion")),
+                Texto(reader, "NombreCliente"),
+                reader.GetDecimal(reader.GetOrdinal("MontoActual")),
+                reader.GetDecimal(reader.GetOrdinal("MontoPleno")),
+                reader.GetDecimal(reader.GetOrdinal("Porcentaje")),
+                reader.GetDateTime(reader.GetOrdinal("FechaVencimiento"))));
         }
 
         return lista;

@@ -42,7 +42,7 @@ public sealed class PagoServicio
          *    (IdCotizacion) WHERE Estado = 'pendiente' es lo que impide que un
          *    doble click genere dos links de pago para el mismo cobro.
          * ------------------------------------------------------------------- */
-        var reserva = await _repositorio.ReservarAsync(
+        Task<ReservaPago?> Reservar() => _repositorio.ReservarAsync(
             solicitud.IdCotizacion,
             solicitud.NombreCliente.Trim(),
             solicitud.PayerEmail.Trim(),
@@ -52,6 +52,28 @@ public sealed class PagoServicio
             solicitud.UsuarioCreacion,
             solicitud.Origen,
             ct);
+
+        var reserva = await Reservar();
+
+        /* -------------------------------------------------------------------
+         * 1 bis) Reemplazo deliberado. El índice está para que un doble click
+         *    no deje dos links vivos, pero hay un caso legítimo que choca con
+         *    él: volver a cobrarle al mismo cliente el mes siguiente cuando el
+         *    link anterior quedó sin pagar. Con la bandera puesta se cancela el
+         *    pendiente —venciendo su link en MercadoPago— y se reserva de nuevo.
+         *
+         *    El segundo intento puede volver a fallar si alguien creó otro
+         *    cobro en el medio; ahí sí corresponde el rechazo.
+         * ------------------------------------------------------------------- */
+        if (reserva is null && solicitud.ReemplazarPendiente)
+        {
+            await CancelarPendienteAsync(
+                solicitud.IdCotizacion,
+                "Reemplazado por un cobro nuevo",
+                ct);
+
+            reserva = await Reservar();
+        }
 
         if (reserva is null)
         {
@@ -220,6 +242,67 @@ public sealed class PagoServicio
         _log.LogInformation(
             "Pago único {Referencia} actualizado a {Estado} ({Detalle}).",
             pago.ExternalReference, pago.Status, pago.StatusDetail);
+    }
+
+    /// <summary>
+    /// Cancela el cobro pendiente de una cotización y vence su link en
+    /// MercadoPago, para que el cliente no pueda pagarlo más tarde.
+    ///
+    /// Devuelve el pago que se canceló, o null si no había ninguno pendiente.
+    ///
+    /// El vencimiento en MercadoPago es **mejor esfuerzo**: si falla, se
+    /// registra el error y la fila se cancela igual. Dejarla pendiente porque no
+    /// se pudo hablar con MercadoPago trabaría el cobro nuevo, que es justamente
+    /// lo que se está destrabando. Lo que se asume a cambio es un link viejo que
+    /// sigue vivo, y por eso el fallo queda logueado como error y no como aviso.
+    /// </summary>
+    public async Task<PagoUnicoDto?> CancelarPendienteAsync(
+        int idCotizacion,
+        string? motivo,
+        CancellationToken ct = default)
+    {
+        var pendiente = await _repositorio
+            .ObtenerPendientePorCotizacionAsync(idCotizacion, ct);
+
+        if (pendiente is null) return null;
+
+        /* Sin preferencia asignada no hay link que vencer: es una reserva que
+           nunca llegó a MercadoPago. */
+        if (!string.IsNullOrWhiteSpace(pendiente.MpPreferenceId))
+        {
+            try
+            {
+                await _mercadoPago.ExpirarPreferenciaAsync(
+                    pendiente.MpPreferenceId, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex,
+                    "No se pudo vencer la preferencia {Preferencia} del pago {Id}. " +
+                    "El link viejo puede seguir aceptando pagos.",
+                    pendiente.MpPreferenceId, pendiente.IdPago);
+            }
+        }
+
+        var cancelado = await _repositorio.CancelarPendienteAsync(
+            pendiente.IdPago, motivo, ct);
+
+        if (!cancelado)
+        {
+            /* Dejó de estar pendiente entre la lectura y el UPDATE: se acreditó
+               o lo canceló otro. No es un error, pero conviene que quede. */
+            _log.LogWarning(
+                "El pago {Id} ya no estaba pendiente al cancelarlo.",
+                pendiente.IdPago);
+
+            return null;
+        }
+
+        _log.LogWarning(
+            "Pago {Id} ({Referencia}) cancelado. Motivo: {Motivo}.",
+            pendiente.IdPago, pendiente.ExternalReference, motivo);
+
+        return pendiente;
     }
 
     private static string ArmarConcepto(CrearPagoSolicitud solicitud)

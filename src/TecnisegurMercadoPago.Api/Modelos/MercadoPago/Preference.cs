@@ -301,3 +301,25 @@ public sealed class DetalleTransaccion
     [JsonPropertyName("net_received_amount")]
     public decimal? NetReceivedAmount { get; set; }
 }
+
+/// <summary>
+/// Cuerpo del PUT que da por vencida una preferencia de Checkout Pro.
+///
+/// MercadoPago no tiene "borrar preferencia": lo más parecido es marcarla
+/// vencida, y a partir de ahí el link deja de aceptar pagos. Es lo que hace
+/// falta al reemplazar un link pendiente por otro — si el viejo siguiera vivo,
+/// el cliente podría pagar el importe anterior.
+/// </summary>
+public sealed class PreferenciaVencimiento
+{
+    [JsonPropertyName("expires")]
+    public bool Expires { get; set; } = true;
+
+    /// <summary>
+    /// ISO 8601 con offset, que es como lo quiere MercadoPago
+    /// ("2026-09-02T10:15:00.000-03:00"). Se manda una fecha ya pasada: la
+    /// intención es que el link muera ahora, no dentro de un rato.
+    /// </summary>
+    [JsonPropertyName("expiration_date_to")]
+    public string ExpirationDateTo { get; set; } = string.Empty;
+}

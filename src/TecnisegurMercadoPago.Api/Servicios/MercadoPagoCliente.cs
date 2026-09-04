@@ -159,11 +159,11 @@ public sealed class MercadoPagoCliente
     /// Todo lo que la llame queda en el log con su origen: ver
     /// <see cref="AuditoriaPreapproval"/>.
     ///
-    /// Manda <see cref="EstadoSuscripcion.Cancelada"/> —<c>canceled</c>, una
-    /// sola ele—, que es lo que documenta MercadoPago hoy. Antes iba
-    /// <c>cancelled</c> y también funcionaba; el cambio alinea el valor con la
-    /// documentación vigente en vez de depender de que sigan aceptando el
-    /// sinónimo.
+    /// Manda <see cref="EstadoSuscripcion.CanceladaSaliente"/> —<c>cancelled</c>,
+    /// con dos eles—. La documentación de MercadoPago dice <c>canceled</c>, pero
+    /// la API lo rechaza: medido el 02/09/2026, responde
+    /// <c>400 "invalid preapproval status parm canceled"</c>. Manda la API.
+    /// No volver a "corregirlo" contra la documentación sin probarlo antes.
     ///
     /// <paramref name="origen"/> es obligatorio a propósito. Sin él una
     /// cancelación futura volvería a ser anónima, que es justamente lo que
@@ -174,7 +174,7 @@ public sealed class MercadoPagoCliente
         string origen,
         CancellationToken ct = default)
     {
-        var cuerpo = new PreapprovalActualizacion { Status = EstadoSuscripcion.Cancelada };
+        var cuerpo = new PreapprovalActualizacion { Status = EstadoSuscripcion.CanceladaSaliente };
 
         _log.LogWarning(
             "Cancelando el preapproval {Preapproval} en MercadoPago. Origen: {Origen}.",
@@ -231,6 +231,43 @@ public sealed class MercadoPagoCliente
             "/checkout/preferences",
             solicitud,
             claveIdempotencia,
+            ct);
+    }
+
+    /// <summary>
+    /// Da por vencida una preferencia, de modo que el link deje de aceptar
+    /// pagos.
+    ///
+    /// Es lo más cerca que hay de cancelar un link: MercadoPago no expone
+    /// borrar una preferencia. Se usa al reemplazar un cobro pendiente por otro
+    /// —el caso de volver a cobrarle al mismo cliente el mes siguiente—, porque
+    /// dejar vivo el link anterior habilita que el cliente pague el importe
+    /// viejo y que entren dos cobros por lo mismo.
+    ///
+    /// La fecha va un minuto en el pasado: MercadoPago compara contra su propio
+    /// reloj y un "ahora" exacto queda a merced de la diferencia entre relojes.
+    /// </summary>
+    public Task<PreferenciaRespuesta> ExpirarPreferenciaAsync(
+        string preferenciaId,
+        CancellationToken ct = default)
+    {
+        var cuerpo = new PreferenciaVencimiento
+        {
+            Expires = true,
+            ExpirationDateTo = DateTimeOffset.Now
+                .AddMinutes(-1)
+                .ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
+        };
+
+        _log.LogWarning(
+            "Venciendo la preferencia {Preferencia} en MercadoPago.",
+            preferenciaId);
+
+        return EnviarAsync<PreferenciaRespuesta>(
+            HttpMethod.Put,
+            $"/checkout/preferences/{preferenciaId}",
+            cuerpo,
+            claveIdempotencia: null,
             ct);
     }
 

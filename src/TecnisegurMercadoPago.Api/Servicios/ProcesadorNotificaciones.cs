@@ -1,5 +1,7 @@
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Options;
+using TecnisegurMercadoPago.Api.Configuracion;
 using TecnisegurMercadoPago.Api.Datos;
 using TecnisegurMercadoPago.Api.Modelos.MercadoPago;
 
@@ -28,6 +30,17 @@ public sealed class ProcesadorNotificaciones : BackgroundService
 
     private DateTime _proximoRepasoLiberacion = DateTime.MinValue;
 
+    /// <summary>
+    /// Cada cuánto se buscan descuentos vencidos. Diario alcanza y sobra: el
+    /// vencimiento tiene granularidad de meses, y llegar un día tarde a subir
+    /// una cuota es intrascendente al lado de no subirla nunca.
+    /// </summary>
+    private static readonly TimeSpan IntervaloRepasoDescuentos = TimeSpan.FromHours(24);
+
+    private const int LoteRepasoDescuentos = 100;
+
+    private DateTime _proximoRepasoDescuentos = DateTime.MinValue;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<ProcesadorNotificaciones> _log;
 
@@ -51,6 +64,7 @@ public sealed class ProcesadorNotificaciones : BackgroundService
             {
                 await ProcesarLoteAsync(ct);
                 await RepasarLiberacionesAsync(ct);
+                await RepasarDescuentosVencidosAsync(ct);
             }
             catch (OperationCanceledException)
             {
@@ -120,6 +134,113 @@ public sealed class ProcesadorNotificaciones : BackgroundService
 
         await RepasarCuotasAsync(scope, mercadoPago, ct);
         await RepasarPagosUnicosAsync(scope, mercadoPago, ct);
+    }
+
+    /// <summary>
+    /// Restituye el importe pleno de las suscripciones cuyo descuento venció.
+    ///
+    /// EL PROBLEMA QUE RESUELVE
+    /// Un preapproval tiene un solo transaction_amount, fijo. Creada la
+    /// suscripción con el importe ya descontado, MercadoPago cobra ese importe
+    /// para siempre: la columna Meses de CotizacionDescuento no la hacía cumplir
+    /// nadie. Un "20% por 6 meses" era, en los hechos, 20% de por vida.
+    ///
+    /// QUÉ NO HACE ESTE MÉTODO
+    /// No calcula descuentos. Toda la regla —cuál descuento cuenta, cuándo
+    /// vence, cuál es el importe pleno— vive en
+    /// vw_SuscripcionesDescuentoVencido. Acá sólo se lee esa lista y se relaya
+    /// el monto, que es exactamente lo que hace la API en el alta.
+    ///
+    /// ARRANCA EN SIMULACIÓN
+    /// Con MercadoPago:RestituirDescuentosVencidos en false el repaso corre,
+    /// loguea lo que haría y no llama a MercadoPago. Cada fila es un cliente al
+    /// que se le sube la cuota sin que haya hecho nada, y la primera corrida
+    /// alcanza de una vez a todo lo vencido acumulado: conviene mirar la lista
+    /// antes de encenderlo.
+    /// </summary>
+    private async Task RepasarDescuentosVencidosAsync(CancellationToken ct)
+    {
+        if (DateTime.UtcNow < _proximoRepasoDescuentos) return;
+
+        /* Igual que el repaso de liberaciones: se agenda ANTES de trabajar, para
+           que un fallo no lo reintente en el ciclo siguiente (15 segundos). */
+        _proximoRepasoDescuentos = DateTime.UtcNow.Add(IntervaloRepasoDescuentos);
+
+        using var scope = _scopeFactory.CreateScope();
+
+        var repositorio = scope.ServiceProvider
+            .GetRequiredService<SuscripcionRepositorio>();
+
+        var vencidos = await repositorio
+            .ListarDescuentosVencidosAsync(LoteRepasoDescuentos, ct);
+
+        if (vencidos.Count == 0) return;
+
+        var habilitado = scope.ServiceProvider
+            .GetRequiredService<IOptions<MercadoPagoOpciones>>()
+            .Value.RestituirDescuentosVencidos;
+
+        _log.LogInformation(
+            "Descuentos vencidos detectados: {Cantidad}. Restitución {Modo}.",
+            vencidos.Count, habilitado ? "HABILITADA" : "en simulación");
+
+        foreach (var v in vencidos)
+        {
+            _log.LogInformation(
+                "DESCUENTO-VENCIDO suscripcion={Id} cotizacion={Cotizacion} " +
+                "cliente={Cliente} actual={Actual} pleno={Pleno} " +
+                "porcentaje={Porcentaje} vencio={Vencimiento:yyyy-MM-dd}",
+                v.IdSuscripcion, v.IdCotizacion, v.NombreCliente,
+                v.MontoActual, v.MontoPleno, v.Porcentaje, v.FechaVencimiento);
+
+            /* Aviso, no bloqueo. Si el importe pleno no es el que el descuento
+               predice, la cotización se editó después de crear la suscripción y
+               el aumento incluye ese cambio de precio además de la restitución.
+               Es una decisión de negocio que sigue abierta (propagar la edición
+               o bloquearla), así que se deja pasar pero queda visible en el log
+               en vez de moverse en silencio. */
+            var factor = 1m - (v.Porcentaje / 100m);
+
+            if (factor > 0)
+            {
+                var predicho = Math.Round(
+                    v.MontoActual / factor, 2, MidpointRounding.AwayFromZero);
+
+                if (Math.Abs(predicho - v.MontoPleno) > 1m)
+                {
+                    _log.LogWarning(
+                        "La cotización {Cotizacion} cambió de precio desde el alta: " +
+                        "el descuento predice {Predicho} y la cotización dice {Pleno}. " +
+                        "Se va a restituir contra la cotización.",
+                        v.IdCotizacion, predicho, v.MontoPleno);
+                }
+            }
+        }
+
+        if (!habilitado) return;
+
+        var servicio = scope.ServiceProvider
+            .GetRequiredService<SuscripcionServicio>();
+
+        foreach (var v in vencidos)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            /* Una suscripción que falle no puede frenar a las demás: cada una es
+               un cliente distinto y el error de uno no dice nada de los otros.
+               La que falla queda en la vista y se reintenta mañana sola. */
+            try
+            {
+                await servicio.ActualizarMontoAsync(v.IdSuscripcion, v.MontoPleno, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex,
+                    "No se pudo restituir el importe de la suscripción {Id} " +
+                    "a {Pleno}. Se reintenta en el próximo repaso.",
+                    v.IdSuscripcion, v.MontoPleno);
+            }
+        }
     }
 
     private async Task RepasarCuotasAsync(

@@ -8,6 +8,22 @@ using TecnisegurMercadoPago.Api.Servicios;
 var builder = WebApplication.CreateBuilder(args);
 
 /* ---------------------------------------------------------------------------
+ * Log a archivo
+ *
+ * Va primero, antes que cualquier otro registro: si algo falla en el arranque
+ * —por ejemplo el ValidateOnStart de más abajo— queremos que ese fallo quede
+ * escrito. Un error de arranque sin log es exactamente el caso que dejó a esta
+ * API muda durante semanas.
+ *
+ * No reemplaza a la consola: en desarrollo se sigue viendo todo por pantalla.
+ * Lo que agrega es persistencia, que bajo IIS con hostingModel inprocess la
+ * captura de stdout no daba. Ver ArchivoLogger.cs.
+ * --------------------------------------------------------------------------- */
+builder.Logging.AddArchivo(
+    builder.Configuration.GetSection("Logging:Archivo"),
+    builder.Environment.ContentRootPath);
+
+/* ---------------------------------------------------------------------------
  * Configuración
  * --------------------------------------------------------------------------- */
 builder.Services

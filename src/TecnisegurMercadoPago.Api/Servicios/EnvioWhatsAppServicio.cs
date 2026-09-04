@@ -105,7 +105,7 @@ public sealed class EnvioWhatsAppServicio
 
         var nombre = PrimerNombre(solicitud.NombreCliente ?? pago.NombreCliente);
 
-        const string tipo = "Equipamiento";
+        var tipo = TipoDeCobro(pago.Concepto);
 
         var mensaje =
             $"Estimado {nombre}," +
@@ -125,6 +125,31 @@ public sealed class EnvioWhatsAppServicio
                 ["3"] = tipo
             },
             ct);
+    }
+
+    /// <summary>
+    /// Qué se está cobrando, para la línea "Tipo:" del WhatsApp.
+    ///
+    /// Sale del concepto porque un pago único ya no es siempre equipamiento:
+    /// EmpleadoWeb también cobra por acá una cuota mensual suelta, para el
+    /// cliente que no quiere débito automático. Anunciarle "Equipamiento" un
+    /// cobro de su cuota lo manda a preguntar por qué le cobran un equipo.
+    ///
+    /// El concepto viene como "{qué se cobra} - {cliente}"; el nombre no va en
+    /// el mensaje, que ya arranca saludando al cliente por su nombre. Sin
+    /// concepto se conserva el texto histórico: todos los pagos anteriores a
+    /// este cambio son de equipamiento.
+    /// </summary>
+    private static string TipoDeCobro(string? concepto)
+    {
+        if (string.IsNullOrWhiteSpace(concepto))
+            return "Equipamiento";
+
+        var corte = concepto.IndexOf(" - ", StringComparison.Ordinal);
+
+        var tipo = corte > 0 ? concepto[..corte] : concepto;
+
+        return tipo.Trim();
     }
 
     /// <summary>

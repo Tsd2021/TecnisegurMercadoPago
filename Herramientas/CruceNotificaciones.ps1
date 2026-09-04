@@ -56,7 +56,12 @@ if (-not (Test-Path $Sql)) { throw "No existe el script '$Sql'." }
 # ---------------------------------------------------------------------------
 # 1) Guarda de solo lectura
 # ---------------------------------------------------------------------------
-$texto = Get-Content $Sql -Raw
+# -Encoding UTF8 no es opcional. Windows PowerShell 5.1 lee en ANSI por defecto,
+# y los .sql de este repo son UTF-8: sin esto, 'Pago único' llega a SQL Server
+# como 'Pago Ãºnico' y queda guardado así dentro de la vista. Paso el 12/08/2026
+# con vw_CobranzasMercadoPago: el literal corrupto dejó de coincidir con el
+# filtro "Pago único" del módulo de TSD y la grilla salía vacía sin ningún error.
+$texto = Get-Content $Sql -Raw -Encoding UTF8
 
 $escrituras = 'INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|EXEC|EXECUTE|GRANT|REVOKE|BACKUP|RESTORE'
 $halladas = [regex]::Matches($texto, "(?im)\b($escrituras)\b") |

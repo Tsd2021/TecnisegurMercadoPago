@@ -124,6 +124,41 @@ public sealed class PagosController : ControllerBase
     }
 
     /// <summary>
+    /// Cancela el cobro pendiente de una cotización y vence su link en
+    /// MercadoPago, para que el cliente no pueda pagarlo después.
+    ///
+    /// Es la forma de destrabar una cotización cuyo link anterior quedó sin
+    /// pagar. Crear el cobro nuevo con ReemplazarPendiente hace lo mismo en un
+    /// solo paso; este endpoint sirve para cancelar sin generar nada a cambio.
+    ///
+    /// Devuelve 404 si no había ningún cobro pendiente: no es un error, pero el
+    /// llamador tiene que poder distinguirlo de haber cancelado algo.
+    /// </summary>
+    [HttpPost("cotizacion/{idCotizacion:int}/cancelar-pendiente")]
+    [ProducesResponseType(typeof(PagoUnicoDto), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ErrorRespuesta), StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> CancelarPendiente(
+        int idCotizacion, CancellationToken ct)
+    {
+        var motivo = HttpContext.Items["SistemaLlamador"] as string;
+
+        var cancelado = await _servicio.CancelarPendienteAsync(
+            idCotizacion,
+            string.IsNullOrWhiteSpace(motivo)
+                ? "Cancelado a pedido"
+                : $"Cancelado desde {motivo}",
+            ct);
+
+        if (cancelado is null)
+        {
+            return NotFound(new ErrorRespuesta(
+                $"La cotización {idCotizacion} no tiene ningún cobro pendiente."));
+        }
+
+        return Ok(cancelado);
+    }
+
+    /// <summary>
     /// Manda el link de pago al cliente por WhatsApp.
     /// Devuelve 409 si Twilio no está configurado o si el pago ya se acreditó.
     /// </summary>
