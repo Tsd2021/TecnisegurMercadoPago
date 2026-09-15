@@ -1,10 +1,11 @@
-using System.Net.Http.Headers;
 using Microsoft.Extensions.Options;
+using System.Net.Http.Headers;
+using System.Reflection;
 using TecnisegurMercadoPago.Api.Configuracion;
 using TecnisegurMercadoPago.Api.Datos;
 using TecnisegurMercadoPago.Api.Seguridad;
 using TecnisegurMercadoPago.Api.Servicios;
-
+using System.Reflection;
 var builder = WebApplication.CreateBuilder(args);
 
 /* ---------------------------------------------------------------------------
@@ -111,7 +112,31 @@ else
 // Autenticación de los sistemas internos. Excluye /api/webhook y /health.
 app.UseMiddleware<ApiKeyMiddleware>();
 
-app.MapControllers();
+try
+{
+    app.MapControllers();
+}
+catch (ReflectionTypeLoadException ex)
+{
+    var detalles = string.Join(
+        Environment.NewLine + Environment.NewLine,
+        ex.LoaderExceptions
+            .Where(e => e != null)
+            .Select(e => e!.ToString())
+    );
+
+    app.Logger.LogCritical(
+        ex,
+        "ERROR CARGANDO TIPOS:{Salto}{Detalles}",
+        Environment.NewLine,
+        detalles);
+
+    throw new Exception(
+        "ERROR REAL AL CARGAR ASSEMBLIES:" +
+        Environment.NewLine +
+        detalles,
+        ex);
+}
 app.MapHealthChecks("/health");
 
 app.Run();
