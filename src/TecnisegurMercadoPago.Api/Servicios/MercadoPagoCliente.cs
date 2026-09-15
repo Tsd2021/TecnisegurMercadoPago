@@ -100,21 +100,51 @@ public sealed class MercadoPagoCliente
 
     /// <summary>
     /// Crea una suscripción sin plan asociado y devuelve el init_point.
-    /// <paramref name="claveIdempotencia"/> evita que un doble click genere
+    /// <paramref name = "claveIdempotencia" /> evita que un doble click genere
     /// dos suscripciones (y por lo tanto dos cobros al cliente).
     /// </summary>
-    public Task<PreapprovalRespuesta> CrearSuscripcionAsync(
-        PreapprovalSolicitud solicitud,
-        string claveIdempotencia,
-        CancellationToken ct = default)
+    //public Task<PreapprovalRespuesta> CrearSuscripcionAsync(
+    //    PreapprovalSolicitud solicitud,
+    //    string claveIdempotencia,
+    //    CancellationToken ct = default)
+    //{
+    //    return EnviarAsync<PreapprovalRespuesta>(
+    //        HttpMethod.Post,
+    //        "/preapproval",
+    //        solicitud,
+    //        claveIdempotencia,
+    //        ct);
+    //}
+    public async Task<PreapprovalRespuesta> CrearSuscripcionAsync(
+    PreapprovalSolicitud solicitud,
+    string claveIdempotencia,
+    CancellationToken ct = default)
     {
-        return EnviarAsync<PreapprovalRespuesta>(
+        var respuesta = await EnviarAsync<PreapprovalRespuesta>(
             HttpMethod.Post,
             "/preapproval",
             solicitud,
             claveIdempotencia,
             ct);
+
+        if (!string.IsNullOrWhiteSpace(respuesta.InitPoint))
+        {
+            respuesta.InitPoint = LimpiarInitPoint(respuesta.InitPoint);
+        }
+
+        return respuesta;
     }
+
+    private static string LimpiarInitPoint(string url)
+    {
+        return url
+            .Replace("&activation=true", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("?activation=true&", "?", StringComparison.OrdinalIgnoreCase)
+            .Replace("?activation=true", "", StringComparison.OrdinalIgnoreCase);
+    }
+
+
+
 
     public Task<PreapprovalRespuesta> ObtenerSuscripcionAsync(
         string preapprovalId,
