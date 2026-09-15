@@ -413,7 +413,11 @@ public sealed class MercadoPagoCliente
 
         using var respuesta = await _http.SendAsync(peticion, ct);
         var texto = await respuesta.Content.ReadAsStringAsync(ct);
-
+        _log.LogInformation(
+    "Respuesta cruda MercadoPago {Metodo} {Ruta}: {Respuesta}",
+    metodo,
+    ruta,
+    texto);
         if (!respuesta.IsSuccessStatusCode)
         {
             _log.LogError(
